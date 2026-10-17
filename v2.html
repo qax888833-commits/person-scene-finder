@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>인물 장면 찾기 v2</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 20px; background: #f4f4f4; color: #222; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 20px; margin-top: 28px; }
+    p { font-size: 16px; line-height: 1.5; }
+    .box { padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 16px; line-height: 1.5; }
+    input[type=file] { font-size: 16px; }
+    button { font-size: 16px; padding: 10px 14px; margin-top: 10px; margin-right: 6px; border-radius: 8px; border: 1px solid #888; background: #eee; }
+    button:disabled { opacity: 0.5; }
+    #summary { font-size: 17px; font-weight: bold; margin: 12px 0 4px 0; line-height: 1.5; }
+    #perf, #saveNote { font-size: 14px; color: #555; margin-bottom: 8px; line-height: 1.4; }
+    .item { display: flex; gap: 10px; align-items: center; background: #fff; border-radius: 8px; padding: 8px; margin-bottom: 8px; }
+    .item img { width: 72px; height: 72px; border-radius: 6px; flex-shrink: 0; object-fit: cover; background: #ddd; }
+    .item.big img { width: 96px; height: 96px; }
+    .msg { font-size: 14px; line-height: 1.4; word-break: break-all; }
+    .ok { color: #0a7a2f; }
+    .warn { color: #b26a00; }
+    .bad { color: #c62828; }
+    .hint { font-size: 13px; color: #555; line-height: 1.5; }
+    .small-btn { font-size: 13px; padding: 6px 10px; margin-top: 4px; }
+    video { width: 100%; max-height: 38vh; object-fit: contain; border-radius: 8px; background: #000; margin-bottom: 12px; }
+    video.pinned { position: sticky; top: 0; z-index: 5; }
+    .setting { display: block; margin-bottom: 14px; font-size: 16px; line-height: 1.5; }
+    .setting select { font-size: 16px; padding: 4px; max-width: 100%; }
+    .setting input[type=range] { width: 100%; }
+    progress { width: 100%; height: 16px; margin-top: 12px; }
+    #progressText { font-size: 14px; line-height: 1.5; margin: 6px 0 12px 0; }
+    #segSummary { font-size: 16px; font-weight: bold; line-height: 1.5; margin-bottom: 8px; }
+    .seg { background: #fff; border-radius: 8px; padding: 10px; margin-bottom: 8px; line-height: 1.5; font-size: 15px; }
+    #reviewInfo { font-size: 15px; font-weight: bold; margin: 10px 0; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>인물 장면 찾기 (v2)</h1>
+  <div id="status" class="box">얼굴 인식 라이브러리를 불러오는 중입니다... (처음에는 모델을 약 10MB 받을 수 있어 시간이 걸립니다)</div>
+
+  <h2>1단계: 기준 인물 등록</h2>
+  <p>그 사람 혼자 나온 사진을 여러 장 선택하세요. 각도와 밝기가 다양할수록 좋습니다.</p>
+  <input type="file" id="photoInput" accept="image/*" multiple disabled>
+  <div><button id="resetBtn">등록 초기화</button><button id="clearNegBtn">제외 기준 기록 지우기</button></div>
+  <div id="summary"></div>
+  <div id="perf"></div>
+  <div id="saveNote"></div>
+  <div id="list"></div>
+
+  <h2>2단계: 동영상 분석</h2>
+  <input type="file" id="videoInput" accept="video/*" disabled>
+  <div id="videoInfo" class="box" style="display:none; margin-top:12px;"></div>
+  <video id="video" class="pinned" controls playsinline preload="auto" style="display:none;"></video>
+  <button id="pinBtn" style="display:none;">영상 고정 끄기</button>
+
+  <div class="box">
+    <label class="setting">분석 간격 (다음 분석부터 적용)
+      <select id="intervalSel">
+        <option value="2">2초마다 (빠름)</option>
+        <option value="1" selected>1초마다</option>
+        <option value="0.5">0.5초마다 (느리지만 꼼꼼)</option>
+      </select>
+    </label>
+    <label class="setting">분석 해상도 (다음 분석부터 적용)
+      <select id="resSel">
+        <option value="640">640 (빠름, 작은 얼굴은 놓칠 수 있음)</option>
+        <option value="960" selected>960 (기본)</option>
+        <option value="1280">1280 (느림, 메모리를 많이 사용)</option>
+      </select>
+    </label>
+    <label class="setting">확실 기준(유사도): <b id="sureVal">0.65</b>
+      <input type="range" id="sureSlider" min="0.40" max="0.95" step="0.01" value="0.65">
+      <span class="hint">이 값 이상이면 자동으로 "찾는 사람"으로 판단합니다. 높일수록 엄격합니다. 0.65는 임시 시작값이며 정확도를 보장하지 않습니다.</span>
+    </label>
+    <label class="setting">애매 기준(유사도): <b id="unsureVal">0.45</b>
+      <input type="range" id="unsureSlider" min="0.20" max="0.95" step="0.01" value="0.45">
+      <span class="hint">확실 기준과 이 값 사이의 얼굴은 "애매"로 분류되어 3단계에서 확인합니다. 이 값 미만은 다른 사람으로 판단합니다. 0.45도 임시 시작값입니다.</span>
+    </label>
+    <label class="setting">구간 합치기 간격
+      <select id="gapSel">
+        <option value="1">1초</option>
+        <option value="2">2초</option>
+        <option value="3" selected>3초</option>
+        <option value="5">5초</option>
+        <option value="10">10초</option>
+      </select>
+      <span class="hint">얼굴이 잠깐 가려지거나 화면 밖으로 나가도, 이 시간 안에 다시 나오면 한 구간으로 묶습니다.</span>
+    </label>
+  </div>
+
+  <button id="startBtn" disabled>분석 시작</button>
+  <button id="stopBtn" disabled>중단</button>
+  <p class="hint">분석 중에는 화면을 켜 두고 다른 앱으로 이동하지 마세요. 화면이 꺼지거나 앱을 바꾸면 느려지거나 멈출 수 있습니다.</p>
+  <progress id="bar" value="0" max="1"></progress>
+  <div id="progressText"></div>
+
+  <div id="segSummary"></div>
+  <div id="segList"></div>
+
+  <h2>3단계: 영상에서 확인하기</h2>
+  <p class="hint">"영상에서 보기"로 그 장면을 재생해 확인한 뒤 "맞음" 또는 "다른 사람"을 눌러 주세요. 맞음은 기준 인물에 추가되고, 다른 사람은 제외 기준으로 기억되어 비슷한 얼굴이 자동으로 정리됩니다. (이 효과는 아직 검증 전입니다.) 누를 때마다 구간 목록이 다시 계산됩니다.</p>
+  <label class="setting">확인할 목록
+    <select id="reviewSel">
+      <option value="unsure" selected>애매한 얼굴 (먼저 이것부터)</option>
+      <option value="other">제외된 얼굴 중 놓친 사람 찾기</option>
+      <option value="target">찾은 얼굴 중 잘못 포함된 사람 찾기</option>
+    </select>
+  </label>
+  <div id="reviewInfo"></div>
+  <div id="reviewList"></div>
+  <button id="undoBtn" style="display:none;">마지막 확인 취소</button>
+
+  <script>
+    var LIB_PINNED = "https://cdn.jsdelivr.net/npm/@vladmandic/human@3.3.6/";
+    var LIB_LATEST = "https://cdn.jsdelivr.net/npm/@vladmandic/human/";
+    var PHOTO_MAX_SIDE = 1024;
+    var THUMB = 96;
+    var STORAGE_KEY = "psf_person_v2";
+    var MAX_NEGS = 40;
+    var REVIEW_COUNT = 8;
+    var REVIEW_GAP = 2;
+    var REG_WARN_SIM = 0.35;
+
+    var statusBox = document.getElementById("status");
+    var input = document.getElementById("photoInput");
+    var list = document.getElementById("list");
+    var summary = document.getElementById("summary");
+    var perf = document.getElementById("perf");
+    var saveNote = document.getElementById("saveNote");
+    var resetBtn = document.getElementById("resetBtn");
+    var clearNegBtn = document.getElementById("clearNegBtn");
+    var videoInput = document.getElementById("videoInput");
+    var videoInfo = document.getElementById("videoInfo");
+    var video = document.getElementById("video");
+    var pinBtn = document.getElementById("pinBtn");
+    var intervalSel = document.getElementById("intervalSel");
+    var resSel = document.getElementById("resSel");
+    var sureSlider = document.getElementById("sureSlider");
+    var unsureSlider = document.getElementById("unsureSlider");
+    var sureVal = document.getElementById("sureVal");
+    var unsureVal = document.getElementById("unsureVal");
+    var gapSel = document.getElementById("gapSel");
+    var startBtn = document.getElementById("startBtn");
+    var stopBtn = document.getElementById("stopBtn");
+    var bar = document.getElementById("bar");
+    var progressText = document.getElementById("progressText");
+    var segSummary = document.getElementById("segSummary");
+    var segList = document.getElementById("segList");
+    var reviewSel = document.getElementById("reviewSel");
+    var reviewInfo = document.getElementById("reviewInfo");
+    var reviewList = document.getElementById("reviewList");
+    var undoBtn = document.getElementById("undoBtn");
+
+    var human = null;
+    var modelBase = "";
+    var person = { items: [], negs: [] };
+    var currentFile = null;
+    var videoUrl = null;
+    var videoReady = false;
+    var running = false;
+    var stopRequested = false;
+    var frames = [];
+    var framesInterval = 1;
+    var previewEnd = null;
+    var wakeLock = null;
+    var history = [];
+
+    /* ---------- 공통 도구 ---------- */
+
+    function fmt(t) {
+      var tenths = Math.round(t * 10);
+      var m = Math.floor(tenths / 600);
+      var s = (tenths % 600) / 10;
+      return m + ":" + (s < 10 ? "0" : "") + s.toFixed(1);
+    }
+
+    function fmtSec(t) {
+      t = Math.max(0, Math.round(t));
+      var m = Math.floor(t / 60);
+      var s = t % 60;
+      return m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    function pct(x) {
+      return Math.round(x * 100) + "%";
+    }
+
+    function sim(a, b) {
+      try {
+        var s = human.match.similarity(a, b);
+        return (typeof s === "number" && isFinite(s)) ? s : 0;
+      } catch (e) {
+        return 0;
+      }
+    }
+
+    function cropFace(source, box) {
+      var bx = box[0], by = box[1], bw = box[2], bh = box[3];
+      var size = Math.max(bw, bh) * 1.5;
+      var cx = bx + bw / 2;
+      var cy = by + bh / 2;
+      var x0 = cx - size / 2;
+      var y0 = cy - size / 2;
+      var sx = Math.max(0, x0);
+      var sy = Math.max(0, y0);
+      var ex = Math.min(source.width, x0 + size);
+      var ey = Math.min(source.height, y0 + size);
+      var sw = ex - sx;
+      var sh = ey - sy;
+      var c = document.createElement("canvas");
+      c.width = THUMB;
+      c.height = THUMB;
+      var ctx = c.getContext("2d");
+      ctx.fillStyle = "#888";
+      ctx.fillRect(0, 0, THUMB, THUMB);
+      if (sw > 0 && sh > 0) {
+        var k = THUMB / size;
+        ctx.drawImage(source, sx, sy, sw, sh, (sx - x0) * k, (sy - y0) * k, sw * k, sh * k);
+      }
+      return c.toDataURL("image/jpeg", 0.6);
+    }
+
+    /* ---------- 라이브러리 불러오기 ---------- */
+
+    function loadScript(src) {
+      return new Promise(function (resolve, reject) {
+        var s = document.createElement("script");
+        s.src = src;
+        s.onload = function () { resolve(); };
+        s.onerror = function () { reject(new Error("불러오지 못한 주소: " + src)); };
+        document.head.appendChild(s);
+      });
+    }
+
+    async function initHuman() {
+      var libNote = "";
+      try {
+        try {
+          await loadScript(LIB_PINNED + "dist/human.js");
+          modelBase = LIB_PINNED + "models/";
+        } catch (e1) {
+          await loadScript(LIB_LATEST + "dist/human.js");
+          modelBase = LIB_LATEST + "models/";
+          libNote = " (고정 버전을 못 찾아 최신 버전으로 대신 불러왔습니다)";
+        }
+        var Ctor = null;
+        if (typeof Human !== "undefined") {
+          Ctor = Human.Human || Human.default || Human;
+        }
+        if (!Ctor) throw new Error("Human 라이브러리를 찾을 수 없습니다.");
+
+        var config = {
+          modelBasePath: modelBase,
+          cacheSensitivity: 0,
+          debug: false,
+          face: {
+            enabled: true,
+            detector: { maxDetected: 10, minConfidence: 0.25, rotation: false },
+            mesh: { enabled: true },
+            iris: { enabled: false },
+            emotion: { enabled: false },
+            description: { enabled: true }
+          },
+          body: { enabled: false },
+          hand: { enabled: false },
+          object: { enabled: false },
+          gesture: { enabled: false },
+          segmentation: { enabled: false }
+        };
+
+        human = new Ctor(config);
+        statusBox.textContent = "모델을 불러오는 중입니다...";
+        var start = performance.now();
+        await human.load();
+        try { await human.warmup(); } catch (e2) {}
+        var sec = ((performance.now() - start) / 1000).toFixed(1);
+        var backend = "알 수 없음";
+        try { backend = human.tf.getBackend(); } catch (e3) {}
+        var ver = "";
+        try { ver = human.version; } catch (e4) {}
+        statusBox.textContent = "준비 완료 (Human " + ver + ", 모델 로딩 " + sec + "초, 처리 방식: " + backend + ")" + libNote;
+        input.disabled = false;
+        videoInput.disabled = false;
+      } catch (e) {
+        human = null;
+        statusBox.textContent = "오류: 얼굴 인식 준비에 실패했습니다. 인터넷 연결을 확인하고 새로고침해 주세요. (" + e.message + ")";
+      }
+    }
+
+    async function detectFaces(source) {
+      var res = await human.detect(source);
+      var raw = (res && res.face) ? res.face : [];
+      var out = [];
+      for (var i = 0; i < raw.length; i++) {
+        var f = raw[i];
+        if (!f.embedding || f.embedding.length === 0 || !f.box) continue;
+        out.push({
+          box: f.box,
+          score: f.score || f.boxScore || 0,
+          embedding: Array.from(f.embedding)
+        });
+      }
+      return { faces: out, rawCount: raw.length };
+    }
+
+    /* ---------- 점수와 판정 ---------- */
+
+    function scoreFace(f) {
+      var p = 0;
+      var n = 0;
+      for (var i = 0; i < person.items.length; i++) {
+        var s = sim(f.desc, person.items[i].descriptor);
+        if (s > p) p = s;
+      }
+      for (var j = 0; j < person.negs.length; j++) {
+        var s2 = sim(f.desc, person.negs[j].descriptor);
+        if (s2 > n) n = s2;
+      }
+      f.pos = p;
+      f.neg = n;
+    }
+
+    function rescoreAll() {
+      for (var i = 0; i < frames.length; i++) {
+        for (var j = 0; j < frames[i].faces.length; j++) {
+          scoreFace(frames[i].faces[j]);
+        }
+      }
+    }
+
+    function statusOf(f) {
+      if (f.label === "yes") return "target";
+      if (f.label === "no") return "other";
+      var sure = parseFloat(sureSlider.value);
+      var unsure = parseFloat(unsureSlider.value);
+      if (f.neg > f.pos && f.neg >= unsure) return "other";
+      if (f.pos >= sure) return "target";
+      if (f.pos >= unsure) return "unsure";
+      return "other";
+    }
+
+    function countStatuses() {
+      var c = { total: 0, target: 0, unsure: 0, other: 0, yes: 0, no: 0, framesWithFace: 0 };
+      for (var i = 0; i < frames.length; i++) {
+        var fr = frames[i];
+        if (fr.faces.length > 0) c.framesWithFace++;
+        for (var j = 0; j < fr.faces.length; j++) {
+          var f = fr.faces[j];
+          c.total++;
+          c[statusOf(f)]++;
+          if (f.label === "yes") c.yes++;
+          if (f.label === "no") c.no++;
+        }
+      }
+      return c;
+    }
+
+    /* ---------- 1단계: 인물 등록 ---------- */
+
+    function fileToCanvas(file) {
+      return new Promise(function (resolve, reject) {
+        var url = URL.createObjectURL(file);
+        var img = new Image();
+        img.onload = function () {
+          var scale = Math.min(1, PHOTO_MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+          var c = document.createElement("canvas");
+          c.width = Math.round(img.naturalWidth * scale);
+          c.height = Math.round(img.naturalHeight * scale);
+          c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+          URL.revokeObjectURL(url);
+          resolve(c);
+        };
+        img.onerror = function () {
+          URL.revokeObjectURL(url);
+          reject(new Error("이 사진을 열 수 없습니다. JPG나 PNG 사진을 선택해 주세요."));
+        };
+        img.src = url;
+      });
+    }
+
+    function makeThumb(source) {
+      var c = document.createElement("canvas");
+      c.width = 64;
+      c.height = 64;
+      var s = Math.min(source.width, source.height);
+      var sx = (source.width - s) / 2;
+      var sy = (source.height - s) / 2;
+      c.getContext("2d").drawImage(source, sx, sy, s, s, 0, 0, 64, 64);
+      return c.toDataURL("image/jpeg", 0.6);
+    }
+
+    function addRow(name) {
+      var div = document.createElement("div");
+      div.className = "item";
+      var thumb = document.createElement("img");
+      thumb.alt = "";
+      var msg = document.createElement("div");
+      msg.className = "msg";
+      var title = document.createElement("div");
+      title.textContent = name;
+      var state = document.createElement("div");
+      state.textContent = "분석 중...";
+      var flag = document.createElement("div");
+      flag.className = "warn";
+      msg.appendChild(title);
+      msg.appendChild(state);
+      msg.appendChild(flag);
+      div.appendChild(thumb);
+      div.appendChild(msg);
+      list.appendChild(div);
+      return { div: div, msg: msg, thumb: thumb, state: state, flag: flag };
+    }
+
+    function setState(row, text, cls) {
+      row.state.textContent = text;
+      row.state.className = cls;
+    }
+
+    function updateSummary() {
+      var n = person.items.length;
+      var photos = 0;
+      for (var i = 0; i < n; i++) {
+        if (person.items[i].src === "photo") photos++;
+      }
+      var text = "등록된 얼굴: " + n + "개 (사진 " + photos + "개, 영상에서 확인 " + (n - photos) + "개) · 제외 기준(다른 사람) " + person.negs.length + "개";
+      if (photos === 0) {
+        text += " — 사진을 선택해 주세요";
+      } else if (photos < 5) {
+        text += " (사진은 5장 이상을 권장합니다. 정확한 적정 장수는 검증 전입니다)";
+      }
+      summary.textContent = text;
+    }
+
+    function checkConsistency() {
+      var items = person.items;
+      for (var i = 0; i < items.length; i++) {
+        items[i].row.flag.textContent = "";
+      }
+      if (items.length < 3) return;
+      for (var a = 0; a < items.length; a++) {
+        var sum = 0;
+        for (var b = 0; b < items.length; b++) {
+          if (a !== b) sum += sim(items[a].descriptor, items[b].descriptor);
+        }
+        var avg = sum / (items.length - 1);
+        if (avg < REG_WARN_SIM) {
+          items[a].row.flag.textContent = "다른 사람 얼굴일 수 있습니다 (다른 등록 얼굴과의 평균 유사도 " + pct(avg) + "). 확인 후 제거해 주세요. (참고용 임시 기준)";
+        }
+      }
+    }
+
+    function roundVec(v) {
+      var out = new Array(v.length);
+      for (var i = 0; i < v.length; i++) out[i] = Math.round(v[i] * 10000) / 10000;
+      return out;
+    }
+
+    function saveRegistration() {
+      try {
+        var data = {
+          items: person.items.map(function (it) { return { d: roundVec(it.descriptor), thumb: it.thumb, src: it.src }; }),
+          negs: person.negs.map(function (n) { return { d: roundVec(n.descriptor), thumb: n.thumb }; })
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        saveNote.textContent = (person.items.length + person.negs.length) > 0 ? "등록 정보는 이 폰의 브라우저에만 저장됩니다. (사진 원본은 저장하지 않고 얼굴 특징 숫자와 작은 얼굴 썸네일만 저장)" : "";
+      } catch (e) {
+        saveNote.textContent = "참고: 이 브라우저에서는 등록 정보를 저장하지 못했습니다. 새로고침하면 다시 등록해야 합니다.";
+      }
+    }
+
+    function loadRegistration() {
+      try {
+        var raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        var data = JSON.parse(raw);
+        var savedItems = data.items || [];
+        for (var i = 0; i < savedItems.length; i++) {
+          var fromVideo = savedItems[i].src === "video";
+          var row = addRow((fromVideo ? "저장된 영상 속 얼굴 " : "저장된 사진 ") + (i + 1));
+          row.thumb.src = savedItems[i].thumb;
+          var item = { descriptor: savedItems[i].d, thumb: savedItems[i].thumb, src: fromVideo ? "video" : "photo", row: row, face: null };
+          person.items.push(item);
+          setState(row, "저장된 얼굴 특징 사용 중", "ok");
+          addRemoveButton(row, item);
+        }
+        var savedNegs = data.negs || [];
+        for (var j = 0; j < savedNegs.length; j++) {
+          person.negs.push({ descriptor: savedNegs[j].d, thumb: savedNegs[j].thumb, face: null });
+        }
+        if (person.items.length + person.negs.length > 0) {
+          saveNote.textContent = "등록 정보는 이 폰의 브라우저에만 저장됩니다. (사진 원본은 저장하지 않고 얼굴 특징 숫자와 작은 얼굴 썸네일만 저장)";
+        }
+      } catch (e) {
+        saveNote.textContent = "저장된 등록 정보를 읽지 못했습니다. 사진을 다시 등록해 주세요.";
+      }
+    }
+
+    function afterLabelChange() {
+      rescoreAll();
+      updateSummary();
+      checkConsistency();
+      saveRegistration();
+      renderSegments();
+      renderReview();
+    }
+
+    function addRemoveButton(row, item) {
+      var btn = document.createElement("button");
+      btn.className = "small-btn";
+      btn.textContent = "제거";
+      btn.addEventListener("click", function () {
+        if (running) return;
+        var idx = person.items.indexOf(item);
+        if (idx >= 0) person.items.splice(idx, 1);
+        if (item.face) {
+          item.face.label = null;
+          item.face.refPos = null;
+        }
+        row.div.remove();
+        afterLabelChange();
+      });
+      row.msg.appendChild(btn);
+    }
+
+    input.addEventListener("change", async function () {
+      var files = Array.from(input.files);
+      if (files.length === 0 || !human) return;
+      input.disabled = true;
+      var t0 = performance.now();
+      var processed = 0;
+
+      for (var i = 0; i < files.length; i++) {
+        summary.textContent = "분석 중... (" + (i + 1) + "/" + files.length + ")";
+        var row = addRow(files[i].name);
+        try {
+          var canvas = await fileToCanvas(files[i]);
+          row.thumb.src = makeThumb(canvas);
+          var det = await detectFaces(canvas);
+          processed++;
+
+          if (det.faces.length === 0) {
+            if (det.rawCount > 0) {
+              setState(row, "실패: 얼굴은 보이지만 얼굴 특징을 계산하지 못했습니다. 다른 사진으로 바꿔 주세요.", "bad");
+            } else {
+              setState(row, "실패: 얼굴을 찾지 못했습니다. 얼굴이 작거나, 어둡거나, 옆모습이거나, 가려졌을 수 있습니다. 정면이 크게 나온 밝은 사진으로 바꿔 주세요.", "bad");
+            }
+          } else if (det.faces.length > 1) {
+            setState(row, "제외: 얼굴이 " + det.faces.length + "개 나옵니다. 그 사람 혼자 나온 사진을 선택해 주세요.", "bad");
+          } else {
+            var f = det.faces[0];
+            var faceThumb = cropFace(canvas, f.box);
+            row.thumb.src = faceThumb;
+            var item = { descriptor: f.embedding, thumb: faceThumb, src: "photo", row: row, face: null };
+            person.items.push(item);
+            var text = "등록됨 (얼굴 확신도 " + Math.round(f.score * 100) + "%)";
+            var cls = "ok";
+            if (f.box[2] / canvas.width < 0.12) {
+              text += " - 주의: 얼굴이 작아서 정확도가 떨어질 수 있습니다.";
+              cls = "warn";
+            } else if (f.score < 0.7) {
+              text += " - 주의: 확신도가 낮습니다. 흐리거나 어두운 사진일 수 있습니다.";
+              cls = "warn";
+            }
+            setState(row, text, cls);
+            addRemoveButton(row, item);
+          }
+        } catch (e) {
+          setState(row, "오류: " + e.message, "bad");
+        }
+      }
+
+      var totalSec = (performance.now() - t0) / 1000;
+      afterLabelChange();
+      if (processed > 0) {
+        perf.textContent = "분석 시간: " + processed + "장 처리, 총 " + totalSec.toFixed(1) + "초 (장당 평균 " + (totalSec / processed).toFixed(1) + "초)";
+      }
+      input.value = "";
+      input.disabled = false;
+    });
+
+    resetBtn.addEventListener("click", function () {
+      if (running) return;
+      person.items = [];
+      person.negs = [];
+      list.innerHTML = "";
+      perf.textContent = "";
+      history = [];
+      for (var i = 0; i < frames.length; i++) {
+        for (var j = 0; j < frames[i].faces.length; j++) {
+          var f = frames[i].faces[j];
+          f.label = null;
+          f.refPos = null;
+          f.refNeg = null;
+        }
+      }
+      afterLabelChange();
+    });
+
+    clearNegBtn.addEventListener("click", function () {
+      if (running) return;
+      person.negs = [];
+      for (var i = 0; i < frames.length; i++) {
+        for (var j = 0; j < frames[i].faces.length; j++) {
+          var f = frames[i].faces[j];
+          if (f.label === "no") f.label = null;
+          f.refNeg = null;
+        }
+      }
+      afterLabelChange();
+    });
+
+    /* ---------- 2단계: 동영상 선택 ---------- */
+
+    videoInput.addEventListener("change", function () {
+      var file = videoInput.files[0];
+      if (!file || running) return;
+      currentFile = file;
+      videoReady = false;
+      startBtn.disabled = true;
+      frames = [];
+      history = [];
+      bar.value = 0;
+      progressText.textContent = "";
+      renderSegments();
+      renderReview();
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+      videoUrl = URL.createObjectURL(file);
+      videoInfo.style.display = "block";
+      videoInfo.textContent = "영상 정보를 읽는 중...";
+      video.style.display = "block";
+      pinBtn.style.display = "inline-block";
+      video.src = videoUrl;
+      video.load();
+    });
+
+    pinBtn.addEventListener("click", function () {
+      var pinned = video.classList.toggle("pinned");
+      pinBtn.textContent = pinned ? "영상 고정 끄기" : "영상 고정 켜기";
+    });
+
+    video.addEventListener("loadedmetadata", function () {
+      var dur = video.duration;
+      if (!isFinite(dur) || dur <= 0) {
+        videoInfo.textContent = "오류: 영상 길이를 알 수 없습니다. 다른 영상으로 시도해 주세요.";
+        return;
+      }
+      videoReady = true;
+      startBtn.disabled = !human;
+      var mb = currentFile ? (currentFile.size / 1048576).toFixed(0) : "?";
+      var text = "영상 길이 " + fmtSec(dur) + ", 크기 " + video.videoWidth + "x" + video.videoHeight + ", 파일 " + mb + "MB";
+      if (dur > 600) {
+        text += "\n주의: 10분이 넘는 영상입니다. 이번 테스트 버전은 긴 영상을 검증하지 않았습니다. 짧은 영상으로 먼저 시험해 보세요.";
+      }
+      videoInfo.style.whiteSpace = "pre-line";
+      videoInfo.textContent = text;
+    });
+
+    video.addEventListener("error", function () {
+      videoReady = false;
+      startBtn.disabled = true;
+      videoInfo.textContent = "오류: 이 영상을 재생할 수 없습니다. 영상 형식(예: H.265/HEVC)을 이 브라우저가 지원하지 않을 수 있습니다. 다른 영상으로 시도해 주세요.";
+    });
+
+    video.addEventListener("timeupdate", function () {
+      if (previewEnd !== null && video.currentTime >= previewEnd) {
+        video.pause();
+        previewEnd = null;
+      }
+    });
+
+    function playRange(a, b) {
+      if (running || !videoReady) return;
+      previewEnd = Math.min(video.duration, b);
+      video.currentTime = Math.max(0, a);
+      var p = video.play();
+      if (p && p.catch) p.catch(function () {});
+    }
+
+    /* ---------- 2단계: 분석 ---------- */
+
+    function seekTo(t) {
+      return new Promise(function (resolve, reject) {
+        if (Math.abs(video.currentTime - t) < 0.005) {
+          resolve();
+          return;
+        }
+        var timer = setTimeout(function () {
+          video.removeEventListener("seeked", onSeeked);
+          reject(new Error("영상 위치 이동 시간 초과"));
+        }, 15000);
+        function onSeeked() {
+          clearTimeout(timer);
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        }
+        video.addEventListener("seeked", onSeeked);
+        video.currentTime = t;
+      });
+    }
+
+    async function lockScreen() {
+      try {
+        if (navigator.wakeLock) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          return true;
+        }
+      } catch (e) {}
+      wakeLock = null;
+      return false;
+    }
+
+    function unlockScreen() {
+      try { if (wakeLock) wakeLock.release(); } catch (e) {}
+      wakeLock = null;
+    }
+
+    async function analyze() {
+      if (running || !videoReady || !human) return;
+      if (person.items.length === 0) {
+        progressText.textContent = "먼저 1단계에서 기준 인물 사진을 등록해 주세요.";
+        return;
+      }
+      running = true;
+      stopRequested = false;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      videoInput.disabled = true;
+      input.disabled = true;
+      resetBtn.disabled = true;
+      clearNegBtn.disabled = true;
+      video.pause();
+      previewEnd = null;
+      frames = [];
+      history = [];
+      for (var a = 0; a < person.items.length; a++) person.items[a].face = null;
+      for (var b = 0; b < person.negs.length; b++) person.negs[b].face = null;
+      segList.innerHTML = "";
+      reviewList.innerHTML = "";
+      reviewInfo.textContent = "";
+      undoBtn.style.display = "none";
+      framesInterval = parseFloat(intervalSel.value);
+      var maxSide = parseInt(resSel.value, 10);
+
+      var awake = false;
+      var errors = 0;
+      var consecutiveErrors = 0;
+      var abortedMsg = "";
+      var hitFrames = 0;
+      var startTs = performance.now();
+
+      try {
+        var dur = video.duration;
+        var times = [];
+        for (var t = 0.1; t < dur; t += framesInterval) times.push(t);
+
+        var scale = Math.min(1, maxSide / Math.max(video.videoWidth, video.videoHeight));
+        var fc = document.createElement("canvas");
+        fc.width = Math.round(video.videoWidth * scale);
+        fc.height = Math.round(video.videoHeight * scale);
+        var fctx = fc.getContext("2d");
+
+        awake = await lockScreen();
+        startTs = performance.now();
+
+        for (var i = 0; i < times.length; i++) {
+          if (stopRequested) break;
+          try {
+            await seekTo(times[i]);
+            fctx.drawImage(video, 0, 0, fc.width, fc.height);
+            var det = await detectFaces(fc);
+            var faceRecs = [];
+            var hit = false;
+            for (var k = 0; k < det.faces.length; k++) {
+              var d = det.faces[k];
+              var rec = { t: times[i], desc: d.embedding, thumb: cropFace(fc, d.box), score: d.score, pos: 0, neg: 0, label: null, refPos: null, refNeg: null };
+              scoreFace(rec);
+              if (statusOf(rec) === "target") hit = true;
+              faceRecs.push(rec);
+            }
+            frames.push({ t: times[i], faces: faceRecs });
+            if (hit) hitFrames++;
+            consecutiveErrors = 0;
+          } catch (e) {
+            errors++;
+            consecutiveErrors++;
+            frames.push({ t: times[i], faces: [], error: true });
+            if (consecutiveErrors >= 5) {
+              abortedMsg = "연속 오류로 중단되었습니다: " + e.message;
+              break;
+            }
+          }
+
+          var done = i + 1;
+          var elapsed = (performance.now() - startTs) / 1000;
+          var avg = elapsed / done;
+          bar.value = done / times.length;
+          progressText.textContent = "프레임 " + done + "/" + times.length + " (" + Math.round(done / times.length * 100) + "%) · 경과 " + fmtSec(elapsed) + " · 남은 예상 " + fmtSec(avg * (times.length - done)) + " · 프레임당 평균 " + avg.toFixed(2) + "초 · 찾은 프레임 " + hitFrames + "개";
+          if (done % 5 === 0) renderSegments();
+          await new Promise(function (r) { setTimeout(r, 0); });
+        }
+
+        var totalSec = (performance.now() - startTs) / 1000;
+        var processedCount = frames.length;
+        var msg = (stopRequested ? "중단됨. " : "분석 완료. ") + "해상도 " + maxSide + ", " + processedCount + "프레임 처리, 총 " + fmtSec(totalSec) + " (프레임당 평균 " + (totalSec / Math.max(1, processedCount)).toFixed(2) + "초)";
+        if (errors > 0) msg += ", 오류 프레임 " + errors + "개";
+        msg += awake ? " · 화면 켜짐 유지: 사용" : " · 화면 켜짐 유지: 미지원(화면이 꺼지지 않게 직접 조심해 주세요)";
+        if (abortedMsg) msg += ". " + abortedMsg;
+        progressText.textContent = msg;
+        renderSegments();
+        renderReview();
+      } catch (e) {
+        progressText.textContent = "오류: 분석 중 문제가 생겼습니다. (" + e.message + ")";
+      } finally {
+        unlockScreen();
+        running = false;
+        stopBtn.disabled = true;
+        startBtn.disabled = !videoReady;
+        videoInput.disabled = false;
+        input.disabled = false;
+        resetBtn.disabled = false;
+        clearNegBtn.disabled = false;
+      }
+    }
+
+    startBtn.addEventListener("click", analyze);
+    stopBtn.addEventListener("click", function () {
+      stopRequested = true;
+      stopBtn.disabled = true;
+    });
+
+    /* ---------- 구간 계산과 표시 ---------- */
+
+    function frameBest(fr) {
+      var best = -1;
+      for (var i = 0; i < fr.faces.length; i++) {
+        var f = fr.faces[i];
+        if (statusOf(f) === "target" && f.pos > best) best = f.pos;
+      }
+      return best;
+    }
+
+    function buildSegments() {
+      var gap = Math.max(parseFloat(gapSel.value), framesInterval * 1.01);
+      var segs = [];
+      for (var i = 0; i < frames.length; i++) {
+        var fr = frames[i];
+        var best = frameBest(fr);
+        if (best < 0) continue;
+        var last = segs[segs.length - 1];
+        if (last && fr.t - last.end <= gap) {
+          last.end = fr.t;
+          last.count++;
+          if (best > last.maxSim) last.maxSim = best;
+        } else {
+          segs.push({ start: fr.t, end: fr.t, count: 1, maxSim: best });
+        }
+      }
+      return segs;
+    }
+
+    function renderSegments() {
+      segList.innerHTML = "";
+      if (frames.length === 0) {
+        segSummary.textContent = "";
+        return;
+      }
+      var segments = buildSegments();
+      var c = countStatuses();
+      segSummary.textContent = "분석한 프레임 " + frames.length + "개 중 얼굴이 보인 프레임 " + c.framesWithFace + "개 (검출된 얼굴 총 " + c.total + "개: 찾는 사람 " + c.target + "개, 애매 " + c.unsure + "개, 다른 사람 " + c.other + "개). 찾은 구간 " + segments.length + "개. 확인 결과: 맞음 " + c.yes + "개, 아님 " + c.no + "개.";
+
+      segments.forEach(function (seg, idx) {
+        var div = document.createElement("div");
+        div.className = "seg";
+        var info = document.createElement("div");
+        info.textContent = "구간 " + (idx + 1) + ": " + fmt(seg.start) + " ~ " + fmt(seg.end) + " (길이 " + (seg.end - seg.start).toFixed(1) + "초, " + seg.count + "프레임 감지, 최고 유사도 " + pct(seg.maxSim) + ")";
+        div.appendChild(info);
+        if (seg.count === 1) {
+          var warn = document.createElement("div");
+          warn.className = "warn";
+          warn.textContent = "1프레임에서만 감지되었습니다. 다른 사람을 잘못 찾은 것일 수 있습니다.";
+          div.appendChild(warn);
+        }
+        var btn = document.createElement("button");
+        btn.textContent = "미리보기 (앞 1초 포함)";
+        btn.addEventListener("click", function () { playRange(seg.start - 1, seg.end + framesInterval); });
+        div.appendChild(btn);
+        segList.appendChild(div);
+      });
+
+      if (segments.length > 0) {
+        var note = document.createElement("div");
+        note.className = "hint";
+        note.textContent = "시작·종료 시간은 분석 간격(" + framesInterval + "초)만큼 오차가 있을 수 있습니다. 정밀 보정은 다음 단계에서 추가합니다.";
+        segList.appendChild(note);
+      }
+    }
+
+    /* ---------- 3단계: 영상에서 확인 ---------- */
+
+    function clearLabel(face) {
+      if (face.refPos) {
+        var i = person.items.indexOf(face.refPos);
+        if (i >= 0) person.items.splice(i, 1);
+        if (face.refPos.row) face.refPos.row.div.remove();
+        face.refPos = null;
+      }
+      if (face.refNeg) {
+        var j = person.negs.indexOf(face.refNeg);
+        if (j >= 0) person.negs.splice(j, 1);
+        face.refNeg = null;
+      }
+      face.label = null;
+    }
+
+    function labelFace(face, t, label) {
+      if (running) return;
+      clearLabel(face);
+      face.label = label;
+      if (label === "yes") {
+        var row = addRow("영상에서 확인 (" + fmt(t) + ")");
+        row.thumb.src = face.thumb;
+        var item = { descriptor: face.desc, thumb: face.thumb, src: "video", row: row, face: face };
+        person.items.push(item);
+        face.refPos = item;
+        setState(row, "영상에서 '맞음'으로 확인한 얼굴", "ok");
+        addRemoveButton(row, item);
+      } else {
+        var neg = { descriptor: face.desc, thumb: face.thumb, face: face };
+        person.negs.push(neg);
+        face.refNeg = neg;
+        if (person.negs.length > MAX_NEGS) {
+          var old = person.negs.shift();
+          if (old.face) old.face.refNeg = null;
+        }
+      }
+      history.push(face);
+      afterLabelChange();
+    }
+
+    undoBtn.addEventListener("click", function () {
+      if (running) return;
+      while (history.length > 0) {
+        var face = history.pop();
+        if (face.label !== null) {
+          clearLabel(face);
+          break;
+        }
+      }
+      afterLabelChange();
+    });
+
+    function addReviewCard(entry) {
+      var face = entry.face;
+      var div = document.createElement("div");
+      div.className = "item big";
+      var img = document.createElement("img");
+      img.alt = "";
+      img.src = face.thumb;
+      var msg = document.createElement("div");
+      msg.className = "msg";
+      var info = document.createElement("div");
+      var text = fmt(entry.t) + " · 등록 얼굴과 유사도 " + pct(face.pos);
+      if (person.negs.length > 0) text += " · 제외 기준과 유사도 " + pct(face.neg);
+      info.textContent = text;
+      msg.appendChild(info);
+
+      var viewBtn = document.createElement("button");
+      viewBtn.className = "small-btn";
+      viewBtn.textContent = "영상에서 보기";
+      viewBtn.addEventListener("click", function () { playRange(entry.t - 1, entry.t + 1.5); });
+      var yesBtn = document.createElement("button");
+      yesBtn.className = "small-btn";
+      yesBtn.textContent = "✅ 맞음";
+      yesBtn.addEventListener("click", function () { labelFace(face, entry.t, "yes"); });
+      var noBtn = document.createElement("button");
+      noBtn.className = "small-btn";
+      noBtn.textContent = "❌ 다른 사람";
+      noBtn.addEventListener("click", function () { labelFace(face, entry.t, "no"); });
+      msg.appendChild(viewBtn);
+      msg.appendChild(yesBtn);
+      msg.appendChild(noBtn);
+
+      div.appendChild(img);
+      div.appendChild(msg);
+      reviewList.appendChild(div);
+    }
+
+    function renderReview() {
+      reviewList.innerHTML = "";
+      undoBtn.style.display = history.length > 0 ? "inline-block" : "none";
+      if (frames.length === 0) {
+        reviewInfo.textContent = "";
+        return;
+      }
+      var mode = reviewSel.value;
+      var pool = [];
+      for (var i = 0; i < frames.length; i++) {
+        for (var j = 0; j < frames[i].faces.length; j++) {
+          var f = frames[i].faces[j];
+          if (f.label === null && statusOf(f) === mode) pool.push({ t: frames[i].t, face: f });
+        }
+      }
+      if (mode === "target") {
+        pool.sort(function (x, y) { return x.face.pos - y.face.pos; });
+      } else {
+        pool.sort(function (x, y) { return y.face.pos - x.face.pos; });
+      }
+      var picked = [];
+      for (var k = 0; k < pool.length && picked.length < REVIEW_COUNT; k++) {
+        var ok = true;
+        for (var m = 0; m < picked.length; m++) {
+          if (Math.abs(picked[m].t - pool[k].t) < REVIEW_GAP) { ok = false; break; }
+        }
+        if (ok) picked.push(pool[k]);
+      }
+      if (pool.length === 0) {
+        reviewInfo.textContent = "이 목록에 확인할 얼굴이 없습니다.";
+      } else {
+        reviewInfo.textContent = "이 목록의 얼굴 " + pool.length + "개 중 " + picked.length + "개를 보여 줍니다. (같은 시간대는 겹치지 않게 골랐고, 확인할 때마다 비슷한 얼굴이 자동으로 정리됩니다)";
+      }
+      picked.forEach(addReviewCard);
+    }
+
+    reviewSel.addEventListener("change", renderReview);
+
+    /* ---------- 기준값 슬라이더 ---------- */
+
+    function onThresholdChange() {
+      sureVal.textContent = parseFloat(sureSlider.value).toFixed(2);
+      unsureVal.textContent = parseFloat(unsureSlider.value).toFixed(2);
+      renderSegments();
+      renderReview();
+    }
+
+    sureSlider.addEventListener("input", function () {
+      if (parseFloat(unsureSlider.value) > parseFloat(sureSlider.value)) unsureSlider.value = sureSlider.value;
+      onThresholdChange();
+    });
+    unsureSlider.addEventListener("input", function () {
+      if (parseFloat(unsureSlider.value) > parseFloat(sureSlider.value)) sureSlider.value = unsureSlider.value;
+      onThresholdChange();
+    });
+    gapSel.addEventListener("change", renderSegments);
+
+    /* ---------- 시작 ---------- */
+
+    loadRegistration();
+    updateSummary();
+    initHuman();
+  </script>
+</body>
+  </html>
