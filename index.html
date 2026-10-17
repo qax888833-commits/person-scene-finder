@@ -8,28 +8,47 @@
     body { font-family: sans-serif; margin: 0; padding: 20px; background: #f4f4f4; color: #222; }
     h1 { font-size: 24px; }
     p { font-size: 16px; line-height: 1.5; }
-    #status { padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 16px; line-height: 1.5; }
-    #photo { max-width: 100%; margin-top: 16px; border-radius: 8px; display: none; }
+    .box { padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 16px; line-height: 1.5; }
     input[type=file] { font-size: 16px; }
-    #result { font-size: 18px; font-weight: bold; margin-top: 12px; line-height: 1.5; }
+    button { font-size: 16px; padding: 10px 14px; margin-top: 10px; border-radius: 8px; border: 1px solid #888; background: #eee; }
+    #summary { font-size: 18px; font-weight: bold; margin: 12px 0 4px 0; line-height: 1.5; }
+    #perf { font-size: 14px; color: #555; margin-bottom: 12px; }
+    .item { display: flex; gap: 10px; align-items: center; background: #fff; border-radius: 8px; padding: 8px; margin-bottom: 8px; }
+    .item canvas { width: 64px; height: 64px; border-radius: 6px; flex-shrink: 0; }
+    .msg { font-size: 14px; line-height: 1.4; word-break: break-all; }
+    .ok { color: #0a7a2f; }
+    .warn { color: #b26a00; }
+    .bad { color: #c62828; }
+    .small-btn { font-size: 13px; padding: 4px 8px; margin-top: 4px; }
   </style>
 </head>
 <body>
   <h1>인물 장면 찾기</h1>
-  <div id="status">모델을 불러오는 중입니다...</div>
+  <div id="status" class="box">모델을 불러오는 중입니다... (처음에는 약 7MB를 받아서 시간이 걸릴 수 있습니다)</div>
 
-  <p>1단계: 인물 사진을 선택하세요.</p>
-  <input type="file" id="photoInput" accept="image/*" disabled>
-  <div id="result"></div>
-  <img id="photo" alt="선택한 사진">
+  <p>1단계: 기준 인물 사진을 여러 장 선택하세요. (그 사람 혼자 나온 사진, 각도와 밝기가 다양할수록 좋습니다)</p>
+  <input type="file" id="photoInput" accept="image/*" multiple disabled>
+  <div><button id="resetBtn">등록 초기화</button></div>
+
+  <div id="summary">등록된 사진: 0장</div>
+  <div id="perf"></div>
+  <div id="list"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
   <script>
     var MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model/";
+    var MAX_SIDE = 800;
+    var SAME_PERSON_DISTANCE = 0.6;
+
     var statusBox = document.getElementById("status");
     var input = document.getElementById("photoInput");
-    var photo = document.getElementById("photo");
-    var result = document.getElementById("result");
+    var list = document.getElementById("list");
+    var summary = document.getElementById("summary");
+    var perf = document.getElementById("perf");
+    var resetBtn = document.getElementById("resetBtn");
+
+    var options = null;
+    var person = { name: "인물 1", items: [] };
 
     async function loadModels() {
       if (typeof faceapi === "undefined") {
@@ -39,6 +58,9 @@
       try {
         var start = performance.now();
         await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+        await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+        await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+        options = new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.5 });
         var sec = ((performance.now() - start) / 1000).toFixed(1);
         var backend = "알 수 없음";
         try { backend = faceapi.tf.getBackend(); } catch (e) {}
@@ -49,34 +71,173 @@
       }
     }
 
-    input.addEventListener("change", function () {
-      var file = input.files[0];
-      if (!file) return;
-      result.textContent = "분석 중...";
-      photo.style.display = "none";
+    function fileToCanvas(file) {
+      return new Promise(function (resolve, reject) {
+        var url = URL.createObjectURL(file);
+        var img = new Image();
+        img.onload = function () {
+          var scale = Math.min(1, MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+          var c = document.createElement("canvas");
+          c.width = Math.round(img.naturalWidth * scale);
+          c.height = Math.round(img.naturalHeight * scale);
+          c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+          URL.revokeObjectURL(url);
+          resolve(c);
+        };
+        img.onerror = function () {
+          URL.revokeObjectURL(url);
+          reject(new Error("이 사진을 열 수 없습니다. JPG나 PNG 사진을 선택해 주세요."));
+        };
+        img.src = url;
+      });
+    }
 
-      photo.onload = async function () {
-        photo.style.display = "block";
+    function drawThumb(thumb, source) {
+      var s = Math.min(source.width, source.height);
+      var sx = (source.width - s) / 2;
+      var sy = (source.height - s) / 2;
+      thumb.getContext("2d").drawImage(source, sx, sy, s, s, 0, 0, 64, 64);
+    }
+
+    function distance(a, b) {
+      var sum = 0;
+      for (var i = 0; i < a.length; i++) {
+        var d = a[i] - b[i];
+        sum += d * d;
+      }
+      return Math.sqrt(sum);
+    }
+
+    function addRow(name) {
+      var div = document.createElement("div");
+      div.className = "item";
+      var thumb = document.createElement("canvas");
+      thumb.width = 64;
+      thumb.height = 64;
+      var msg = document.createElement("div");
+      msg.className = "msg";
+      var title = document.createElement("div");
+      title.textContent = name;
+      var state = document.createElement("div");
+      state.textContent = "분석 중...";
+      var flag = document.createElement("div");
+      flag.className = "warn";
+      msg.appendChild(title);
+      msg.appendChild(state);
+      msg.appendChild(flag);
+      div.appendChild(thumb);
+      div.appendChild(msg);
+      list.appendChild(div);
+      return { div: div, msg: msg, thumb: thumb, state: state, flag: flag };
+    }
+
+    function setState(row, text, cls) {
+      row.state.textContent = text;
+      row.state.className = cls;
+    }
+
+    function updateSummary() {
+      var n = person.items.length;
+      var text = "등록된 사진: " + n + "장";
+      if (n === 0) {
+        text += " (사진을 선택해 주세요)";
+      } else if (n < 5) {
+        text += " (처음에는 5장 이상을 권장합니다. 정확한 적정 장수는 아직 검증 전입니다)";
+      }
+      summary.textContent = text;
+    }
+
+    function checkConsistency() {
+      var items = person.items;
+      for (var i = 0; i < items.length; i++) {
+        items[i].row.flag.textContent = "";
+      }
+      if (items.length < 3) return;
+      for (var a = 0; a < items.length; a++) {
+        var sum = 0;
+        for (var b = 0; b < items.length; b++) {
+          if (a !== b) sum += distance(items[a].descriptor, items[b].descriptor);
+        }
+        var avg = sum / (items.length - 1);
+        if (avg > SAME_PERSON_DISTANCE) {
+          items[a].row.flag.textContent = "다른 사람 사진일 수 있습니다 (다른 사진들과의 평균 거리 " + avg.toFixed(2) + "). 확인 후 제거해 주세요.";
+        }
+      }
+    }
+
+    function addRemoveButton(row, item) {
+      var btn = document.createElement("button");
+      btn.className = "small-btn";
+      btn.textContent = "제거";
+      btn.addEventListener("click", function () {
+        var idx = person.items.indexOf(item);
+        if (idx >= 0) person.items.splice(idx, 1);
+        row.div.remove();
+        updateSummary();
+        checkConsistency();
+      });
+      row.msg.appendChild(btn);
+    }
+
+    input.addEventListener("change", async function () {
+      var files = Array.from(input.files);
+      if (files.length === 0) return;
+      input.disabled = true;
+      var t0 = performance.now();
+      var processed = 0;
+
+      for (var i = 0; i < files.length; i++) {
+        summary.textContent = "분석 중... (" + (i + 1) + "/" + files.length + ")";
+        var row = addRow(files[i].name);
         try {
-          var options = new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.5 });
-          var faces = await faceapi.detectAllFaces(photo, options);
-          if (faces.length === 0) {
-            result.textContent = "얼굴을 찾지 못했습니다. 얼굴이 작거나, 너무 어둡거나, 옆모습이거나, 마스크·선글라스로 가려졌을 수 있습니다. 정면이 크게 나온 밝은 사진으로 다시 선택해 주세요.";
-          } else if (faces.length === 1) {
-            result.textContent = "얼굴 1개 검출됨 (확신도 " + Math.round(faces[0].score * 100) + "%)";
+          var canvas = await fileToCanvas(files[i]);
+          drawThumb(row.thumb, canvas);
+          var found = await faceapi.detectAllFaces(canvas, options).withFaceLandmarks().withFaceDescriptors();
+          processed++;
+
+          if (found.length === 0) {
+            setState(row, "실패: 얼굴을 찾지 못했습니다. 얼굴이 작거나, 어둡거나, 옆모습이거나, 가려졌을 수 있습니다. 정면이 크게 나온 밝은 사진으로 바꿔 주세요.", "bad");
+          } else if (found.length > 1) {
+            setState(row, "제외: 얼굴이 " + found.length + "개 나옵니다. 그 사람 혼자 나온 사진을 선택해 주세요.", "bad");
           } else {
-            result.textContent = "얼굴 " + faces.length + "개 검출됨. 기준 인물은 한 명만 나온 사진이 좋습니다.";
+            var det = found[0].detection;
+            var item = { descriptor: found[0].descriptor, row: row };
+            person.items.push(item);
+            var text = "등록됨 (확신도 " + Math.round(det.score * 100) + "%)";
+            var cls = "ok";
+            if (det.box.width / canvas.width < 0.12) {
+              text += " - 주의: 얼굴이 작아서 정확도가 떨어질 수 있습니다.";
+              cls = "warn";
+            } else if (det.score < 0.7) {
+              text += " - 주의: 확신도가 낮습니다. 흐리거나 어두운 사진일 수 있습니다.";
+              cls = "warn";
+            }
+            setState(row, text, cls);
+            addRemoveButton(row, item);
           }
         } catch (e) {
-          result.textContent = "오류: 분석에 실패했습니다. (" + e.message + ")";
+          setState(row, "오류: " + e.message, "bad");
         }
-      };
-      photo.onerror = function () {
-        result.textContent = "오류: 이 사진을 열 수 없습니다. 다른 사진(JPG, PNG)을 선택해 주세요.";
-      };
-      photo.src = URL.createObjectURL(file);
+      }
+
+      var totalSec = (performance.now() - t0) / 1000;
+      if (processed > 0) {
+        perf.textContent = "분석 시간: " + processed + "장 처리, 총 " + totalSec.toFixed(1) + "초 (장당 평균 " + (totalSec / processed).toFixed(1) + "초)";
+      }
+      updateSummary();
+      checkConsistency();
+      input.value = "";
+      input.disabled = false;
     });
 
+    resetBtn.addEventListener("click", function () {
+      person.items = [];
+      list.innerHTML = "";
+      perf.textContent = "";
+      updateSummary();
+    });
+
+    updateSummary();
     loadModels();
   </script>
 </body>
