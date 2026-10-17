@@ -26,11 +26,12 @@
     .setting { display: block; margin-bottom: 14px; font-size: 16px; line-height: 1.5; }
     .setting select { font-size: 16px; padding: 4px; }
     .setting input[type=range] { width: 100%; }
-    .hint { font-size: 13px; color: #555; }
+    .hint { font-size: 13px; color: #555; line-height: 1.5; }
     progress { width: 100%; height: 16px; margin-top: 12px; }
     #progressText { font-size: 14px; line-height: 1.5; margin: 6px 0 12px 0; }
     #segSummary { font-size: 16px; font-weight: bold; line-height: 1.5; margin-bottom: 8px; }
     .seg { background: #fff; border-radius: 8px; padding: 10px; margin-bottom: 8px; line-height: 1.5; font-size: 15px; }
+    #galleryInfo { font-size: 15px; font-weight: bold; margin: 10px 0; }
   </style>
 </head>
 <body>
@@ -52,6 +53,13 @@
   <video id="video" controls playsinline preload="auto" style="display:none;"></video>
 
   <div class="box">
+    <label class="setting">검출 방식 (다음 분석부터 적용)
+      <select id="modeSel">
+        <option value="fast">빠름 (가벼운 검출기)</option>
+        <option value="balanced" selected>균형 (작은 얼굴도 더 찾음, 더 느림)</option>
+        <option value="precise">정밀 (가장 정확, 가장 느림, 모델 약 5MB 추가)</option>
+      </select>
+    </label>
     <label class="setting">분석 간격 (다음 분석부터 적용)
       <select id="intervalSel">
         <option value="2">2초마다 (빠름)</option>
@@ -84,13 +92,39 @@
   <div id="segSummary"></div>
   <div id="segList"></div>
 
+  <h2>3단계: 검출된 얼굴 확인</h2>
+  <p class="hint">분석이 끝나면 영상에서 검출된 얼굴을 등록 사진과 가까운 순서로 보여 줍니다. 위에서부터 보면서 찾는 사람과 다른 사람이 어느 거리에서 섞이는지 확인하세요. 찾는 사람 얼굴은 "등록에 추가"로 등록할 수 있습니다. 추가한 뒤 "목록 새로고침"을 누르면 거리가 다시 계산됩니다. (추가 효과는 아직 검증 전입니다)</p>
+  <div id="galleryInfo"></div>
+  <div id="gallery"></div>
+  <button id="moreBtn" style="display:none;">더 보기</button>
+  <button id="refreshBtn" style="display:none;">목록 새로고침 (거리 다시 계산)</button>
+
   <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
   <script>
     var MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model/";
     var PHOTO_MAX_SIDE = 800;
-    var FRAME_MAX_SIDE = 640;
     var REG_WARN_DISTANCE = 0.6;
     var STORAGE_KEY = "psf_person_v1";
+    var THUMB = 72;
+    var GALLERY_PAGE = 40;
+
+    var MODES = {
+      fast: {
+        name: "빠름",
+        frameSide: 640,
+        make: function () { return new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.5 }); }
+      },
+      balanced: {
+        name: "균형",
+        frameSide: 960,
+        make: function () { return new faceapi.TinyFaceDetectorOptions({ inputSize: 608, scoreThreshold: 0.4 }); }
+      },
+      precise: {
+        name: "정밀",
+        frameSide: 960,
+        make: function () { return new faceapi.SsdMobilenetv1Options({ minConfidence: 0.4 }); }
+      }
+    };
 
     var statusBox = document.getElementById("status");
     var input = document.getElementById("photoInput");
@@ -103,6 +137,7 @@
     var videoInput = document.getElementById("videoInput");
     var videoInfo = document.getElementById("videoInfo");
     var video = document.getElementById("video");
+    var modeSel = document.getElementById("modeSel");
     var intervalSel = document.getElementById("intervalSel");
     var thSlider = document.getElementById("thSlider");
     var thVal = document.getElementById("thVal");
@@ -113,6 +148,10 @@
     var progressText = document.getElementById("progressText");
     var segSummary = document.getElementById("segSummary");
     var segList = document.getElementById("segList");
+    var galleryInfo = document.getElementById("galleryInfo");
+    var gallery = document.getElementById("gallery");
+    var moreBtn = document.getElementById("moreBtn");
+    var refreshBtn = document.getElementById("refreshBtn");
 
     var options = null;
     var person = { name: "인물 1", items: [] };
@@ -127,6 +166,10 @@
     var segments = [];
     var previewEnd = null;
     var wakeLock = null;
+    var ssdLoaded = false;
+    var faceList = [];
+    var galleryShown = 0;
+    var galleryCards = [];
 
     /* ---------- 공통 도구 ---------- */
 
@@ -153,6 +196,56 @@
       return Math.sqrt(sum);
     }
 
+    function bestDist(desc) {
+      var best = Infinity;
+      for (var k = 0; k < person.items.length; k++) {
+        var d = distance(desc, person.items[k].descriptor);
+        if (d < best) best = d;
+      }
+      return best;
+    }
+
+    function scoreFrame(fr) {
+      var best = Infinity;
+      for (var f = 0; f < fr.faces.length; f++) {
+        var d = bestDist(fr.faces[f].desc);
+        fr.faces[f].dist = d;
+        if (d < best) best = d;
+      }
+      fr.dist = best;
+    }
+
+    function recomputeDistances() {
+      for (var i = 0; i < frames.length; i++) {
+        scoreFrame(frames[i]);
+      }
+    }
+
+    function cropFace(source, box) {
+      var size = Math.max(box.width, box.height) * 1.5;
+      var cx = box.x + box.width / 2;
+      var cy = box.y + box.height / 2;
+      var x0 = cx - size / 2;
+      var y0 = cy - size / 2;
+      var sx = Math.max(0, x0);
+      var sy = Math.max(0, y0);
+      var ex = Math.min(source.width, x0 + size);
+      var ey = Math.min(source.height, y0 + size);
+      var sw = ex - sx;
+      var sh = ey - sy;
+      var c = document.createElement("canvas");
+      c.width = THUMB;
+      c.height = THUMB;
+      var ctx = c.getContext("2d");
+      ctx.fillStyle = "#888";
+      ctx.fillRect(0, 0, THUMB, THUMB);
+      if (sw > 0 && sh > 0) {
+        var k = THUMB / size;
+        ctx.drawImage(source, sx, sy, sw, sh, (sx - x0) * k, (sy - y0) * k, sw * k, sh * k);
+      }
+      return c.toDataURL("image/jpeg", 0.7);
+    }
+
     /* ---------- 모델 로딩 ---------- */
 
     async function loadModels() {
@@ -174,6 +267,16 @@
         videoInput.disabled = false;
       } catch (e) {
         statusBox.textContent = "오류: 모델 파일을 불러오지 못했습니다. (" + e.message + ")";
+      }
+    }
+
+    async function ensureDetector(modeKey) {
+      if (modeKey === "precise" && !ssdLoaded) {
+        progressText.textContent = "정밀 검출 모델(약 5MB)을 불러오는 중입니다...";
+        var t0 = performance.now();
+        await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+        ssdLoaded = true;
+        progressText.textContent = "정밀 검출 모델 로딩 " + ((performance.now() - t0) / 1000).toFixed(1) + "초";
       }
     }
 
@@ -270,10 +373,10 @@
     function saveRegistration() {
       try {
         var data = person.items.map(function (it) {
-          return { d: Array.from(it.descriptor), thumb: it.thumb };
+          return { d: Array.from(it.descriptor), thumb: it.thumb, src: it.src || "photo" };
         });
         localStorage.setItem(STORAGE_KEY, JSON.stringify({ name: person.name, items: data }));
-        saveNote.textContent = person.items.length > 0 ? "등록 정보는 이 폰의 브라우저에만 저장되어 있습니다. (사진 원본은 저장하지 않고 얼굴 특징 숫자만 저장)" : "";
+        saveNote.textContent = person.items.length > 0 ? "등록 정보는 이 폰의 브라우저에만 저장되어 있습니다. (사진 원본은 저장하지 않고 얼굴 특징 숫자와 작은 얼굴 썸네일만 저장)" : "";
       } catch (e) {
         saveNote.textContent = "참고: 이 브라우저에서는 등록 정보를 저장하지 못했습니다. 새로고침하면 다시 등록해야 합니다.";
       }
@@ -286,15 +389,16 @@
         var data = JSON.parse(raw);
         var saved = data.items || [];
         for (var i = 0; i < saved.length; i++) {
-          var row = addRow("저장된 사진 " + (i + 1));
+          var fromVideo = saved[i].src === "video";
+          var row = addRow((fromVideo ? "저장된 영상 속 얼굴 " : "저장된 사진 ") + (i + 1));
           row.thumb.src = saved[i].thumb;
-          var item = { descriptor: new Float32Array(saved[i].d), thumb: saved[i].thumb, row: row };
+          var item = { descriptor: new Float32Array(saved[i].d), thumb: saved[i].thumb, src: fromVideo ? "video" : "photo", row: row };
           person.items.push(item);
           setState(row, "저장된 얼굴 특징 사용 중", "ok");
           addRemoveButton(row, item);
         }
         if (person.items.length > 0) {
-          saveNote.textContent = "등록 정보는 이 폰의 브라우저에만 저장되어 있습니다. (사진 원본은 저장하지 않고 얼굴 특징 숫자만 저장)";
+          saveNote.textContent = "등록 정보는 이 폰의 브라우저에만 저장되어 있습니다. (사진 원본은 저장하지 않고 얼굴 특징 숫자와 작은 얼굴 썸네일만 저장)";
         }
       } catch (e) {
         saveNote.textContent = "저장된 등록 정보를 읽지 못했습니다. 사진을 다시 등록해 주세요.";
@@ -313,6 +417,8 @@
         updateSummary();
         checkConsistency();
         saveRegistration();
+        recomputeDistances();
+        renderSegments();
       });
       row.msg.appendChild(btn);
     }
@@ -329,8 +435,7 @@
         var row = addRow(files[i].name);
         try {
           var canvas = await fileToCanvas(files[i]);
-          var thumbUrl = makeThumb(canvas);
-          row.thumb.src = thumbUrl;
+          row.thumb.src = makeThumb(canvas);
           var found = await faceapi.detectAllFaces(canvas, options).withFaceLandmarks().withFaceDescriptors();
           processed++;
 
@@ -340,7 +445,9 @@
             setState(row, "제외: 얼굴이 " + found.length + "개 나옵니다. 그 사람 혼자 나온 사진을 선택해 주세요.", "bad");
           } else {
             var det = found[0].detection;
-            var item = { descriptor: found[0].descriptor, thumb: thumbUrl, row: row };
+            var faceThumb = cropFace(canvas, det.box);
+            row.thumb.src = faceThumb;
+            var item = { descriptor: found[0].descriptor, thumb: faceThumb, src: "photo", row: row };
             person.items.push(item);
             var text = "등록됨 (확신도 " + Math.round(det.score * 100) + "%)";
             var cls = "ok";
@@ -366,6 +473,8 @@
       updateSummary();
       checkConsistency();
       saveRegistration();
+      recomputeDistances();
+      renderSegments();
       input.value = "";
       input.disabled = false;
     });
@@ -377,6 +486,8 @@
       perf.textContent = "";
       updateSummary();
       saveRegistration();
+      recomputeDistances();
+      renderSegments();
     });
 
     /* ---------- 2단계: 동영상 선택 ---------- */
@@ -388,6 +499,12 @@
       videoReady = false;
       startBtn.disabled = true;
       frames = [];
+      faceList = [];
+      galleryCards = [];
+      gallery.innerHTML = "";
+      galleryInfo.textContent = "";
+      moreBtn.style.display = "none";
+      refreshBtn.style.display = "none";
       bar.value = 0;
       progressText.textContent = "";
       renderSegments();
@@ -484,45 +601,64 @@
       video.pause();
       previewEnd = null;
       frames = [];
+      faceList = [];
+      galleryCards = [];
       segList.innerHTML = "";
+      gallery.innerHTML = "";
+      galleryInfo.textContent = "";
+      moreBtn.style.display = "none";
+      refreshBtn.style.display = "none";
       framesInterval = parseFloat(intervalSel.value);
 
-      var dur = video.duration;
-      var times = [];
-      for (var t = 0.1; t < dur; t += framesInterval) times.push(t);
-
-      var scale = Math.min(1, FRAME_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight));
-      var fc = document.createElement("canvas");
-      fc.width = Math.round(video.videoWidth * scale);
-      fc.height = Math.round(video.videoHeight * scale);
-      var fctx = fc.getContext("2d");
-
-      var awake = await lockScreen();
-      var startTs = performance.now();
+      var modeKey = modeSel.value;
+      var mode = MODES[modeKey] || MODES.balanced;
+      var awake = false;
       var errors = 0;
       var consecutiveErrors = 0;
       var abortedMsg = "";
+      var hitFrames = 0;
+      var startTs = performance.now();
 
       try {
+        await ensureDetector(modeKey);
+        var detOpts = mode.make();
+
+        var dur = video.duration;
+        var times = [];
+        for (var t = 0.1; t < dur; t += framesInterval) times.push(t);
+
+        var scale = Math.min(1, mode.frameSide / Math.max(video.videoWidth, video.videoHeight));
+        var fc = document.createElement("canvas");
+        fc.width = Math.round(video.videoWidth * scale);
+        fc.height = Math.round(video.videoHeight * scale);
+        var fctx = fc.getContext("2d");
+
+        awake = await lockScreen();
+        startTs = performance.now();
+
         for (var i = 0; i < times.length; i++) {
           if (stopRequested) break;
           try {
             await seekTo(times[i]);
             fctx.drawImage(video, 0, 0, fc.width, fc.height);
-            var found = await faceapi.detectAllFaces(fc, options).withFaceLandmarks().withFaceDescriptors();
-            var best = Infinity;
+            var found = await faceapi.detectAllFaces(fc, detOpts).withFaceLandmarks().withFaceDescriptors();
+            var faceItems = [];
             for (var f = 0; f < found.length; f++) {
-              for (var k = 0; k < person.items.length; k++) {
-                var d = distance(found[f].descriptor, person.items[k].descriptor);
-                if (d < best) best = d;
-              }
+              faceItems.push({
+                desc: found[f].descriptor,
+                thumb: cropFace(fc, found[f].detection.box),
+                dist: Infinity,
+                added: false
+              });
             }
-            frames.push({ t: times[i], dist: best, faces: found.length });
+            var fr = { t: times[i], faces: faceItems, dist: Infinity };
+            scoreFrame(fr);
+            frames.push(fr);
             consecutiveErrors = 0;
           } catch (e) {
             errors++;
             consecutiveErrors++;
-            frames.push({ t: times[i], dist: Infinity, faces: 0, error: true });
+            frames.push({ t: times[i], faces: [], dist: Infinity, error: true });
             if (consecutiveErrors >= 5) {
               abortedMsg = "연속 오류로 중단되었습니다: " + e.message;
               break;
@@ -533,10 +669,7 @@
           var elapsed = (performance.now() - startTs) / 1000;
           var avg = elapsed / done;
           var th = parseFloat(thSlider.value);
-          var hitFrames = 0;
-          for (var h = 0; h < frames.length; h++) {
-            if (frames[h].dist <= th) hitFrames++;
-          }
+          if (frames[frames.length - 1].dist <= th) hitFrames++;
           bar.value = done / times.length;
           progressText.textContent = "프레임 " + done + "/" + times.length + " (" + Math.round(done / times.length * 100) + "%) · 경과 " + fmtSec(elapsed) + " · 남은 예상 " + fmtSec(avg * (times.length - done)) + " · 프레임당 평균 " + avg.toFixed(2) + "초 · 찾은 프레임 " + hitFrames + "개";
           if (done % 5 === 0) renderSegments();
@@ -545,12 +678,13 @@
 
         var totalSec = (performance.now() - startTs) / 1000;
         var processedCount = frames.length;
-        var msg = (stopRequested ? "중단됨. " : "분석 완료. ") + processedCount + "프레임 처리, 총 " + fmtSec(totalSec) + " (프레임당 평균 " + (totalSec / Math.max(1, processedCount)).toFixed(2) + "초)";
+        var msg = (stopRequested ? "중단됨. " : "분석 완료. ") + "검출 방식: " + mode.name + ", " + processedCount + "프레임 처리, 총 " + fmtSec(totalSec) + " (프레임당 평균 " + (totalSec / Math.max(1, processedCount)).toFixed(2) + "초)";
         if (errors > 0) msg += ", 오류 프레임 " + errors + "개";
         msg += awake ? " · 화면 켜짐 유지: 사용" : " · 화면 켜짐 유지: 미지원(화면이 꺼지지 않게 직접 조심해 주세요)";
         if (abortedMsg) msg += ". " + abortedMsg;
         progressText.textContent = msg;
         renderSegments();
+        renderGallery();
       } catch (e) {
         progressText.textContent = "오류: 분석 중 문제가 생겼습니다. (" + e.message + ")";
       } finally {
@@ -607,12 +741,14 @@
       }
       segments = buildSegments();
       var withFace = 0;
+      var totalFaces = 0;
       var minAll = Infinity;
       for (var i = 0; i < frames.length; i++) {
-        if (frames[i].faces > 0) withFace++;
+        if (frames[i].faces.length > 0) withFace++;
+        totalFaces += frames[i].faces.length;
         if (frames[i].dist < minAll) minAll = frames[i].dist;
       }
-      var text = "분석한 프레임 " + frames.length + "개 중 얼굴이 보인 프레임 " + withFace + "개. 찾은 구간 " + segments.length + "개.";
+      var text = "분석한 프레임 " + frames.length + "개 중 얼굴이 보인 프레임 " + withFace + "개 (검출된 얼굴 총 " + totalFaces + "개). 찾은 구간 " + segments.length + "개.";
       if (minAll !== Infinity) {
         text += " 등록 사진과 가장 가까웠던 거리: " + minAll.toFixed(2) + " (기준값이 이보다 커야 찾아집니다)";
       }
@@ -645,9 +781,116 @@
       }
     }
 
+    /* ---------- 3단계: 검출된 얼굴 목록 ---------- */
+
+    function renderGallery() {
+      faceList = [];
+      for (var i = 0; i < frames.length; i++) {
+        for (var f = 0; f < frames[i].faces.length; f++) {
+          faceList.push({ t: frames[i].t, face: frames[i].faces[f] });
+        }
+      }
+      faceList.sort(function (a, b) { return a.face.dist - b.face.dist; });
+      gallery.innerHTML = "";
+      galleryCards = [];
+      galleryShown = 0;
+      if (faceList.length === 0) {
+        galleryInfo.textContent = "검출된 얼굴이 없습니다. 검출 방식을 '정밀'로 바꿔 다시 분석해 보세요.";
+        moreBtn.style.display = "none";
+        refreshBtn.style.display = "none";
+        return;
+      }
+      galleryInfo.textContent = "검출된 얼굴 " + faceList.length + "개 (등록 사진과 가까운 순서)";
+      refreshBtn.style.display = "inline-block";
+      showMoreFaces();
+    }
+
+    function showMoreFaces() {
+      var end = Math.min(faceList.length, galleryShown + GALLERY_PAGE);
+      for (var i = galleryShown; i < end; i++) {
+        addFaceCard(faceList[i]);
+      }
+      galleryShown = end;
+      moreBtn.style.display = galleryShown < faceList.length ? "inline-block" : "none";
+      updateGalleryLabels();
+    }
+
+    function addFaceCard(entry) {
+      var face = entry.face;
+      var div = document.createElement("div");
+      div.className = "item";
+      var img = document.createElement("img");
+      img.alt = "";
+      img.src = face.thumb;
+      var msg = document.createElement("div");
+      msg.className = "msg";
+      var info = document.createElement("div");
+      info.textContent = fmt(entry.t) + " · 거리 " + face.dist.toFixed(2);
+      var label = document.createElement("div");
+      var btn = document.createElement("button");
+      btn.className = "small-btn";
+      if (face.added) {
+        btn.textContent = "등록에 추가됨";
+        btn.disabled = true;
+      } else {
+        btn.textContent = "찾는 사람이 맞음 → 등록에 추가";
+        btn.addEventListener("click", function () { addFaceToRegistration(entry, btn); });
+      }
+      msg.appendChild(info);
+      msg.appendChild(label);
+      msg.appendChild(btn);
+      div.appendChild(img);
+      div.appendChild(msg);
+      gallery.appendChild(div);
+      galleryCards.push({ dist: face.dist, label: label });
+    }
+
+    function updateGalleryLabels() {
+      var th = parseFloat(thSlider.value);
+      for (var i = 0; i < galleryCards.length; i++) {
+        var c = galleryCards[i];
+        if (c.dist <= th) {
+          c.label.textContent = "기준값 안쪽 → 찾는 사람으로 판단";
+          c.label.className = "ok";
+        } else {
+          c.label.textContent = "기준값 밖 → 다른 사람으로 판단";
+          c.label.className = "hint";
+        }
+      }
+    }
+
+    function addFaceToRegistration(entry, btn) {
+      if (running) return;
+      var face = entry.face;
+      if (face.added) return;
+      face.added = true;
+      var row = addRow("영상에서 추가 (" + fmt(entry.t) + ")");
+      row.thumb.src = face.thumb;
+      var item = { descriptor: face.desc, thumb: face.thumb, src: "video", row: row };
+      person.items.push(item);
+      setState(row, "영상 속 얼굴로 등록됨", "ok");
+      addRemoveButton(row, item);
+      updateSummary();
+      checkConsistency();
+      saveRegistration();
+      recomputeDistances();
+      renderSegments();
+      btn.disabled = true;
+      btn.textContent = "등록에 추가됨 (목록 새로고침을 누르면 거리가 다시 계산됩니다)";
+    }
+
+    moreBtn.addEventListener("click", showMoreFaces);
+    refreshBtn.addEventListener("click", function () {
+      if (running) return;
+      recomputeDistances();
+      renderSegments();
+      renderGallery();
+    });
+
     thSlider.addEventListener("input", function () {
       thVal.textContent = parseFloat(thSlider.value).toFixed(2);
       renderSegments();
+      updateGalleryLabels();
     });
     gapSel.addEventListener("change", renderSegments);
 
@@ -658,4 +901,4 @@
     loadModels();
   </script>
 </body>
-</html>
+  </html>
