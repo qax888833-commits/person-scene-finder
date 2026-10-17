@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>인물 장면 찾기 v9</title></head>
+<body>
+<p id="m" style="font-family:sans-serif;padding:20px">v9 불러오는 중...</p>
+<script type="text/plain" id="patch">
+(function () {
+  var MUX = "https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.js";
+  var box = document.createElement("div");
+  box.className = "box";
+  box.style.display = "none";
+  box.innerHTML =
+    '<h2 style="margin-top:0">4단계: 구간 편집하고 영상 만들기</h2>' +
+    '<div class="hint">3단계에서 "맞음"으로 확인한 장면은 자동으로 이 목록에 추가됩니다. 버튼을 누르면 위의 영상이 그 지점으로 이동합니다. 영상을 직접 돌려 원하는 위치에 멈춘 뒤 "현재 위치 → 시작/끝"을 눌러도 됩니다. 편집 내용은 이 폰에 자동 저장됩니다.</div>' +
+    '<label class="setting" style="margin-top:8px">조절 단위 <select id="eStep"><option value="0.1">0.1초</option><option value="0.5" selected>0.5초</option><option value="1">1초</option></select></label>' +
+    '<div id="eList"></div>' +
+    '<div><button id="eAdd">+ 구간 추가 (현재 위치부터 5초)</button><button id="eMerge">자동 구간 추가로 합치기</button></div>' +
+    '<div><button id="eAuto">자동 구간으로 다시 채우기</button><button id="eCopy">편집한 구간 목록 복사</button></div>' +
+    '<div><button id="fMake" style="font-weight:bold">편집한 구간으로 영상 만들기</button>' +
+    '<button id="fStop" style="display:none">중단 (지금까지 녹화한 부분으로 만들기)</button></div>' +
+    '<div id="fText" class="hint" style="margin-top:8px"></div>' +
+    '<div id="fResult" style="margin-top:8px"></div>';
+  document.body.appendChild(box);
+
+  var eStep = document.getElementById("eStep");
+  var eList = document.getElementById("eList");
+  var fMake = document.getElementById("fMake");
+  var fStop = document.getElementById("fStop");
+  var fText = document.getElementById("fText");
+  var fResult = document.getElementById("fResult");
+  var eds = [];
+  var dismissed = [];
+  var syncNote = "";
+  var loadedKey = null, filled = false;
+  var busy = false, abort = false;
+  var resultUrls = [];
+  var cv = document.createElement("canvas");
+  var aCtx = null, aSrc = null, aSpk = null;
+
+  function sKey() { return "psf_edit|" + videoKey(); }
+  function persist() { try { localStorage.setItem(sKey(), JSON.stringify({ v: 2, eds: eds, dismissed: dismissed })); } catch (e) {} }
+  function step() { return parseFloat(eStep.value); }
+  function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+  function overlaps(a, b) { return a.s < b.e && b.s < a.e; }
+
+  function fromAuto() {
+    return buildSegments().map(function (g) {
+      return { s: Math.max(0, g.start - framesInterval - 1), e: Math.min(video.duration, g.end + framesInterval + 1), on: true };
+    });
+  }
+
+  function labeledRanges() {
+    var ts = [];
+    frames.forEach(function (fr) {
+      if (fr.faces.some(function (f) { return f.label === "yes"; })) ts.push(fr.t);
+    });
+    var gap = Math.max(parseFloat(gapSel.value), framesInterval * 1.01);
+    var out = [];
+    ts.forEach(function (t) {
+      var l = out[out.length - 1];
+      if (l && t - l.e <= gap) l.e = t;
+      else out.push({ s: t, e: t });
+    });
+    return out.map(function (g) {
+      return { s: Math.max(0, g.s - framesInterval - 1), e: Math.min(video.duration, g.e + framesInterval + 1), on: true };
+    });
+  }
+
+  function mergeIn(list) {
+    var added = 0;
+    list.forEach(function (n) {
+      var hit = eds.some(function (g) { return overlaps(g, n); }) || dismissed.some(function (g) { return overlaps(g, n); });
+      if (!hit) { eds.push(n); added++; }
+    });
+    return added;
+  }
+
+  function sync() {
+    var k = videoKey();
+    if (!k || !videoReady) return;
+    if (loadedKey !== k) {
+      loadedKey = k; filled = false; eds = []; dismissed = []; syncNote = "";
+      var raw = null;
+      try { raw = localStorage.getItem(sKey()); } catch (e) {}
+      if (raw) {
+        try {
+          var p = JSON.parse(raw);
+          if (Array.isArray(p)) { eds = p; }
+          else if (p && Array.isArray(p.eds)) { eds = p.eds; dismissed = Array.isArray(p.dismissed) ? p.dismissed : []; }
+          filled = true;
+        } catch (e2) { eds = []; }
+      }
+    }
+    if (running || frames.length === 0) return;
+    if (!filled) {
+      eds = fromAuto();
+      filled = true;
+      persist();
+    } else {
+      var n = mergeIn(labeledRanges());
+      if (n > 0) {
+        persist();
+        syncNote = "맞음으로 확인한 장면 " + n + "개 구간을 목록에 추가했습니다. ";
+      }
+    }
+  }
+
+  function desc(g) {
+    return fmt(g.s) + " ~ " + fmt(g.e) + " (길이 " + (g.e - g.s).toFixed(1) + "초)";
+  }
+
+  function ranges() {
+    var rs = eds.filter(function (g) { return g.on; }).map(function (g) { return [g.s, g.e]; });
+    rs.sort(function (a, b) { return a[0] - b[0]; });
+    var merged = [];
+    rs.forEach(function (r) {
+      var l = merged[merged.length - 1];
+      if (l && r[0] <= l[1]) l[1] = Math.max(l[1], r[1]);
+      else merged.push([r[0], r[1]]);
+    });
+    return merged;
+  }
+
+  function updateSum() {
+    var rs = ranges(), total = 0;
+    rs.forEach(function (r) { total += r[1] - r[0]; });
+    fMake.disabled = rs.length === 0 || !videoReady || busy;
+    if (!busy) fText.textContent = syncNote + (rs.length === 0 ? "체크된 구간이 없습니다." : "영상으로 만들 구간 합계 약 " + fmtSec(total) + " (녹화에 그만큼 시간이 걸립니다)");
+  }
+
+  function showAt(t) {
+    if (running || recording || busy) return;
+    previewEnd = null;
+    try { video.pause(); video.currentTime = clamp(t, 0, video.duration); } catch (e) {}
+  }
+
+  function mk(parent, text, fn) {
+    var b = document.createElement("button");
+    b.className = "small-btn";
+    b.textContent = text;
+    b.addEventListener("click", fn);
+    parent.appendChild(b);
+    return b;
+  }
+
+  function renderFinal() {
+    if (busy) return;
+    sync();
+    box.style.display = videoReady ? "block" : "none";
+    eList.innerHTML = "";
+    if (!videoReady) return;
+    eds.sort(function (a, b) { return a.s - b.s; });
+    if (eds.length === 0) {
+      var n = document.createElement("div");
+      n.className = "hint";
+      n.textContent = running ? "분석이 끝나면 찾은 구간이 자동으로 채워집니다." : "구간이 없습니다. 분석 후 자동으로 채워지거나, 아래 '+ 구간 추가'로 직접 넣을 수 있습니다.";
+      eList.appendChild(n);
+    }
+    eds.forEach(function (g, i) {
+      var row = document.createElement("div");
+      row.className = "seg";
+      var top = document.createElement("label");
+      top.style.display = "block";
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = g.on;
+      cb.style.marginRight = "8px";
+      var info = document.createElement("span");
+      info.textContent = "구간 " + (i + 1) + ": " + desc(g);
+      cb.addEventListener("change", function () { g.on = cb.checked; persist(); updateSum(); });
+      top.appendChild(cb);
+      top.appendChild(info);
+      row.appendChild(top);
+
+      function nudge(k, d) {
+        var v = Math.round((g[k] + d) * 10) / 10;
+        if (k === "s") v = clamp(v, 0, g.e - 0.3);
+        else v = clamp(v, g.s + 0.3, video.duration);
+        g[k] = v;
+        info.textContent = "구간 " + (i + 1) + ": " + desc(g);
+        persist(); updateSum(); showAt(v);
+      }
+      function setNow(k) {
+        var v = Math.round(video.currentTime * 10) / 10;
+        if (k === "s" && v >= g.e - 0.3) { info.textContent = "시작은 끝보다 앞이어야 합니다."; return; }
+        if (k === "e" && v <= g.s + 0.3) { info.textContent = "끝은 시작보다 뒤여야 합니다."; return; }
+        g[k] = v;
+        info.textContent = "구간 " + (i + 1) + ": " + desc(g);
+        persist(); updateSum();
+      }
+      var r1 = document.createElement("div");
+      mk(r1, "시작 −", function () { nudge("s", -step()); });
+      mk(r1, "시작 +", function () { nudge("s", step()); });
+      mk(r1, "끝 −", function () { nudge("e", -step()); });
+      mk(r1, "끝 +", function () { nudge("e", step()); });
+      row.appendChild(r1);
+      var r2 = document.createElement("div");
+      mk(r2, "현재 위치 → 시작", function () { setNow("s"); });
+      mk(r2, "현재 위치 → 끝", function () { setNow("e"); });
+      mk(r2, "▶ 미리보기", function () { playRange(g.s, g.e); });
+      mk(r2, "삭제", function () {
+        dismissed.push({ s: g.s, e: g.e });
+        eds.splice(eds.indexOf(g), 1);
+        syncNote = "";
+        persist(); renderFinal();
+      });
+      row.appendChild(r2);
+      eList.appendChild(row);
+    });
+    updateSum();
+  }
+
+  function addResult(blob, name, note) {
+    var url = URL.createObjectURL(blob);
+    resultUrls.push(url);
+    var div = document.createElement("div");
+    div.className = "seg";
+    var t = document.createElement("div");
+    t.textContent = name + " · " + (blob.size / 1048576).toFixed(1) + "MB";
+    div.appendChild(t);
+    var nt = document.createElement("div");
+    nt.className = "hint";
+    nt.textContent = note;
+    div.appendChild(nt);
+    var pv = document.createElement("video");
+    pv.src = url; pv.controls = true; pv.playsInline = true; pv.preload = "metadata";
+    pv.style.maxHeight = "30vh";
+    div.appendChild(pv);
+    var a = document.createElement("a");
+    a.href = url; a.download = name; a.textContent = "⬇ 다운로드";
+    a.style.cssText = "display:inline-block;font-size:16px;padding:10px 14px;margin:6px 6px 0 0;border-radius:8px;border:1px solid #888;background:#eee;color:#222;text-decoration:none;";
+    div.appendChild(a);
+    try {
+      var file = new File([blob], name, { type: blob.type.split(";")[0] });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        var sh = document.createElement("button");
+        sh.textContent = "공유로 저장";
+        sh.addEventListener("click", function () { navigator.share({ files: [file] }).catch(function () {}); });
+        div.appendChild(sh);
+      }
+    } catch (e) {}
+    var h = document.createElement("div");
+    h.className = "hint";
+    h.textContent = "다운로드가 안 되면 '공유로 저장'을 누르거나, 위 영상을 길게 눌러 저장해 보세요.";
+    div.appendChild(h);
+    fResult.insertBefore(div, fResult.firstChild);
+  }
+
+  async function make(rs) {
+    if (running || recording || busy || !videoReady || rs.length === 0) return;
+    busy = true; recording = true; abort = false;
+    fMake.disabled = true; fStop.style.display = "inline-block";
+    var useCodec = false, muxer = null, vEnc = null, aEnc = null, proc = null, mute = null, aDest = null;
+    var recorder = null, chunks = [], stopped = null, mime = "";
+    var drawTimer = null, active = false, offset = 0, lastTs = -1, segAudio = 0, segStart = 0, vCount = 0;
+    var encErr = null, started = false, done = 0, hasAudio = false;
+    var total = 0;
+    rs.forEach(function (r) { total += r[1] - r[0]; });
+    try {
+      video.pause(); previewEnd = null;
+      await lockScreen();
+      var s = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight));
+      cv.width = Math.max(2, Math.round(video.videoWidth * s / 2) * 2);
+      cv.height = Math.max(2, Math.round(video.videoHeight * s / 2) * 2);
+      var cctx = cv.getContext("2d");
+      var draw = function () { try { cctx.drawImage(video, 0, 0, cv.width, cv.height); } catch (e) {} };
+
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try {
+          if (!aCtx) {
+            aCtx = new AC();
+            aSrc = aCtx.createMediaElementSource(video);
+            aSpk = aCtx.createGain();
+            aSrc.connect(aSpk);
+            aSpk.connect(aCtx.destination);
+          }
+          await aCtx.resume();
+        } catch (e) { aCtx = null; }
+      }
+
+      var vcodec = null;
+      if (window.VideoEncoder && window.VideoFrame) {
+        try {
+          fText.textContent = "mp4 만들기 준비 중...";
+          if (!window.Mp4Muxer) await loadScript(MUX);
+          if (window.Mp4Muxer) {
+            var cands = ["avc1.640028", "avc1.4d0028", "avc1.42001f"];
+            for (var ci = 0; ci < cands.length && !vcodec; ci++) {
+              try {
+                var sup = await VideoEncoder.isConfigSupported({ codec: cands[ci], width: cv.width, height: cv.height, bitrate: 5000000, framerate: 30 });
+                if (sup && sup.supported) vcodec = cands[ci];
+              } catch (e) {}
+            }
+          }
+        } catch (e) { vcodec = null; }
+      }
+      useCodec = !!vcodec;
+
+      var sr = aCtx ? aCtx.sampleRate : 48000;
+      if (useCodec) {
+        var aOk = false;
+        if (aCtx && window.AudioEncoder && window.AudioData) {
+          try {
+            var sa = await AudioEncoder.isConfigSupported({ codec: "mp4a.40.2", sampleRate: sr, numberOfChannels: 2, bitrate: 128000 });
+            aOk = !!(sa && sa.supported);
+          } catch (e) {}
+        }
+        hasAudio = aOk;
+        muxer = new Mp4Muxer.Muxer({
+          target: new Mp4Muxer.ArrayBufferTarget(),
+          video: { codec: "avc", width: cv.width, height: cv.height },
+          audio: aOk ? { codec: "aac", numberOfChannels: 2, sampleRate: sr } : undefined,
+          fastStart: "in-memory",
+          firstTimestampBehavior: "offset"
+        });
+        vEnc = new VideoEncoder({ output: function (c, m) { muxer.addVideoChunk(c, m); }, error: function (e) { encErr = e; } });
+        vEnc.configure({ codec: vcodec, width: cv.width, height: cv.height, bitrate: 5000000, framerate: 30, avc: { format: "avc" } });
+        if (aOk) {
+          aEnc = new AudioEncoder({ output: function (c, m) { muxer.addAudioChunk(c, m); }, error: function (e) { encErr = e; } });
+          aEnc.configure({ codec: "mp4a.40.2", sampleRate: sr, numberOfChannels: 2, bitrate: 128000 });
+          proc = aCtx.createScriptProcessor(4096, 2, 2);
+          proc.channelCount = 2;
+          proc.channelCountMode = "explicit";
+          mute = aCtx.createGain();
+          mute.gain.value = 0;
+          proc.onaudioprocess = function (ev) {
+            if (!active) return;
+            var L = ev.inputBuffer.getChannelData(0), R = ev.inputBuffer.getChannelData(1);
+            var buf = new Float32Array(L.length * 2);
+            buf.set(L, 0);
+            buf.set(R, L.length);
+            var ts = Math.round((offset + segAudio / sr) * 1e6);
+            segAudio += L.length;
+            try {
+              aEnc.encode(new AudioData({ format: "f32-planar", sampleRate: sr, numberOfFrames: L.length, numberOfChannels: 2, timestamp: ts, data: buf }));
+            } catch (e) {}
+          };
+          aSrc.connect(proc);
+          proc.connect(mute);
+          mute.connect(aCtx.destination);
+          aSpk.disconnect();
+        }
+      } else {
+        if (!window.MediaRecorder || !cv.captureStream) throw new Error("이 브라우저는 영상 만들기를 지원하지 않습니다. 구간 목록을 복사해 갤러리 앱에서 잘라 주세요.");
+        var stream = cv.captureStream(30);
+        if (aCtx) {
+          try {
+            aDest = aCtx.createMediaStreamDestination();
+            aSrc.connect(aDest);
+            aSpk.disconnect();
+            aDest.stream.getAudioTracks().forEach(function (t) { stream.addTrack(t); });
+          } catch (e) { aDest = null; }
+        }
+        mime = pickMime();
+        recorder = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 4000000 } : {});
+        recorder.ondataavailable = function (e) { if (e.data && e.data.size > 0) chunks.push(e.data); };
+        stopped = new Promise(function (res) { recorder.onstop = function () { res(); }; });
+        drawTimer = setInterval(draw, 33);
+      }
+
+      function encodeFrame(mt) {
+        if (encErr || vEnc.encodeQueueSize > 30) return;
+        draw();
+        var ts = Math.round((offset + Math.max(0, mt - segStart)) * 1e6);
+        if (ts <= lastTs) ts = lastTs + 1000;
+        lastTs = ts;
+        var fr = new VideoFrame(cv, { timestamp: ts });
+        vEnc.encode(fr, { keyFrame: vCount % 90 === 0 });
+        fr.close();
+        vCount++;
+      }
+      var hasRvfc = !!video.requestVideoFrameCallback;
+      function onVF(now, meta) {
+        if (!active) return;
+        encodeFrame(meta && typeof meta.mediaTime === "number" ? meta.mediaTime : video.currentTime);
+        video.requestVideoFrameCallback(onVF);
+      }
+      if (useCodec && !hasRvfc) drawTimer = setInterval(function () { if (active) encodeFrame(video.currentTime); }, 33);
+
+      for (var i = 0; i < rs.length; i++) {
+        if (abort || encErr) break;
+        var r = rs[i];
+        segStart = r[0];
+        if (!useCodec && started) recorder.pause();
+        await seekTo(r[0]);
+        if (useCodec) {
+          encodeFrame(r[0]);
+          started = true;
+          active = true;
+          segAudio = 0;
+          await video.play();
+          if (hasRvfc) video.requestVideoFrameCallback(onVF);
+        } else {
+          draw();
+          if (!started) { recorder.start(1000); started = true; } else recorder.resume();
+          await video.play();
+        }
+        await new Promise(function (res) {
+          var iv = setInterval(function () {
+            var cur = video.currentTime;
+            fText.textContent = "녹화 중... 구간 " + (i + 1) + "/" + rs.length + " · 전체 " + fmtSec(done + Math.max(0, cur - r[0])) + " / " + fmtSec(total) + ". 화면을 켜 둔 채 기다려 주세요.";
+            if (abort || encErr || cur >= r[1] || video.ended || video.paused) { clearInterval(iv); res(); }
+          }, 50);
+        });
+        active = false;
+        video.pause();
+        var played = Math.max(0, Math.min(video.currentTime, r[1]) - r[0]);
+        done += played;
+        offset += played;
+      }
+      if (!started) throw new Error("녹화가 시작되지 않았습니다.");
+
+      var blob, ext, note;
+      if (useCodec) {
+        fText.textContent = "mp4 파일로 마무리하는 중...";
+        await vEnc.flush();
+        if (aEnc) await aEnc.flush();
+        if (encErr) throw encErr;
+        muxer.finalize();
+        blob = new Blob([muxer.target.buffer], { type: "video/mp4" });
+        ext = "mp4";
+        note = "일반 mp4(H.264" + (hasAudio ? " + AAC 소리" : ", 소리 없음: 이 폰은 AAC 인코딩을 지원하지 않음") + ")로 만들었습니다. 편집 앱에서 열어 보세요.";
+      } else {
+        await new Promise(function (r2) { setTimeout(r2, 200); });
+        if (recorder.state !== "inactive") recorder.stop();
+        await stopped;
+        var type = recorder.mimeType || mime || "video/webm";
+        blob = new Blob(chunks, { type: type });
+        ext = type.indexOf("mp4") >= 0 ? "mp4" : "webm";
+        note = "이 폰은 일반 mp4 만들기를 지원하지 않아 대체 방식(" + ext + ")으로 만들었습니다. 편집 앱이 열지 못할 수 있습니다.";
+      }
+      if (blob.size === 0) throw new Error("녹화된 내용이 없습니다.");
+      addResult(blob, exportBaseName() + "_편집." + ext, note);
+      fText.textContent = abort ? "중단했습니다. 지금까지 녹화한 부분으로 영상을 만들었습니다. 아래에서 다운로드하세요." : "완성! 아래 '다운로드' 버튼을 눌러 주세요.";
+    } catch (e) {
+      try { if (recorder && recorder.state !== "inactive") recorder.stop(); } catch (e2) {}
+      fText.textContent = "영상 만들기에 실패했습니다: " + (e && e.message ? e.message : e);
+    } finally {
+      active = false;
+      if (drawTimer) clearInterval(drawTimer);
+      try { video.pause(); } catch (e3) {}
+      try { if (vEnc && vEnc.state !== "closed") vEnc.close(); } catch (e5) {}
+      try { if (aEnc && aEnc.state !== "closed") aEnc.close(); } catch (e6) {}
+      try {
+        if (proc) { proc.onaudioprocess = null; aSrc.disconnect(proc); proc.disconnect(); mute.disconnect(); }
+        if (aDest) aSrc.disconnect(aDest);
+        if (aCtx) aSpk.connect(aCtx.destination);
+      } catch (e4) {}
+      unlockScreen();
+      busy = false; recording = false;
+      fStop.style.display = "none";
+      renderFinal();
+    }
+  }
+
+  video.addEventListener("play", function () { if (aCtx && aCtx.state === "suspended") aCtx.resume(); });
+  video.addEventListener("loadedmetadata", function () { renderFinal(); });
+  fMake.addEventListener("click", function () { make(ranges()); });
+  fStop.addEventListener("click", function () { abort = true; });
+  document.getElementById("eAdd").addEventListener("click", function () {
+    var c = Math.round(video.currentTime * 10) / 10;
+    eds.push({ s: c, e: Math.min(Math.round(video.duration * 10) / 10, c + 5), on: true });
+    syncNote = "";
+    persist(); renderFinal();
+  });
+  document.getElementById("eMerge").addEventListener("click", function () {
+    dismissed = [];
+    var n = mergeIn(fromAuto().concat(labeledRanges()));
+    syncNote = n > 0 ? "자동으로 찾은 구간 " + n + "개를 추가했습니다. " : "추가할 새 구간이 없습니다. ";
+    persist(); renderFinal();
+  });
+  document.getElementById("eAuto").addEventListener("click", function () {
+    if (!confirm("자동으로 찾은 구간으로 다시 채웁니다. 지금까지 편집한 내용은 사라집니다. 계속할까요?")) return;
+    eds = fromAuto(); dismissed = []; filled = true; syncNote = "";
+    persist(); renderFinal();
+  });
+  document.getElementById("eCopy").addEventListener("click", async function () {
+    var lines = ["영상: " + (currentFile ? currentFile.name : "")];
+    ranges().forEach(function (r, i) { lines.push("구간 " + (i + 1) + ": " + fmt(r[0]) + " ~ " + fmt(r[1]) + " (" + (r[1] - r[0]).toFixed(1) + "초)"); });
+    var ok = await copyText(lines.join("\n"));
+    fText.textContent = ok ? "편집한 구간 목록을 복사했습니다." : "복사하지 못했습니다.";
+  });
+
+  var wasRunning = false;
+  setInterval(function () {
+    var needs = !running && !busy && videoReady && frames.length > 0 && (!filled || wasRunning);
+    wasRunning = running;
+    if (needs) renderFinal();
+  }, 1000);
+
+  var origRender = renderSegments;
+  renderSegments = function () {
+    origRender();
+    clipBox.style.display = "none";
+    if (!running && !busy) renderFinal();
+  };
+  recordClip = function (seg) {
+    make([[Math.max(0, seg.start - framesInterval - 1), Math.min(video.duration, seg.end + framesInterval + 1)]]);
+  };
+  videoInput.addEventListener("change", function () {
+    eds = []; dismissed = []; syncNote = ""; loadedKey = null; filled = false;
+    fResult.innerHTML = "";
+    resultUrls.forEach(function (u) { URL.revokeObjectURL(u); });
+    resultUrls = [];
+    eList.innerHTML = "";
+    box.style.display = "none";
+  });
+})();
+</script>
+<script>
+(async function(){
+  try{
+    var r=await fetch("v5.html?"+Date.now(),{cache:"no-store"});
+    if(!r.ok) throw new Error("v5.html을 찾을 수 없습니다 ("+r.status+"). v9.html과 같은 폴더에 v5.html이 있어야 합니다.");
+    var h=await r.text();
+    var code=document.getElementById("patch").textContent;
+    var tag="<scr"+"ipt>"+code+"</scr"+"ipt>";
+    var i=h.lastIndexOf("</body>");
+    if(i<0) throw new Error("v5.html 형식이 예상과 다릅니다.");
+    h=h.slice(0,i)+tag+h.slice(i);
+    h=h.replace("인물 장면 찾기 v5","인물 장면 찾기 v9").replace("인물 장면 찾기 (v5)","인물 장면 찾기 (v9)");
+    document.open();document.write(h);document.close();
+  }catch(e){document.getElementById("m").textContent="오류: "+e.message;}
+})();
+</script>
+</body></html>
