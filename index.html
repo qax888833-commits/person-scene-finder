@@ -5,20 +5,79 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>인물 장면 찾기</title>
   <style>
-    body {
-      font-family: sans-serif;
-      margin: 0;
-      padding: 20px;
-      background: #f4f4f4;
-      color: #222;
-    }
+    body { font-family: sans-serif; margin: 0; padding: 20px; background: #f4f4f4; color: #222; }
     h1 { font-size: 24px; }
     p { font-size: 16px; line-height: 1.5; }
+    #status { padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 16px; line-height: 1.5; }
+    #photo { max-width: 100%; margin-top: 16px; border-radius: 8px; display: none; }
+    input[type=file] { font-size: 16px; }
+    #result { font-size: 18px; font-weight: bold; margin-top: 12px; line-height: 1.5; }
   </style>
 </head>
 <body>
   <h1>인물 장면 찾기</h1>
-  <p>페이지가 정상적으로 열렸습니다.</p>
-  <p>다음 단계에서 사진 선택 기능을 추가합니다.</p>
+  <div id="status">모델을 불러오는 중입니다...</div>
+
+  <p>1단계: 인물 사진을 선택하세요.</p>
+  <input type="file" id="photoInput" accept="image/*" disabled>
+  <div id="result"></div>
+  <img id="photo" alt="선택한 사진">
+
+  <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
+  <script>
+    var MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model/";
+    var statusBox = document.getElementById("status");
+    var input = document.getElementById("photoInput");
+    var photo = document.getElementById("photo");
+    var result = document.getElementById("result");
+
+    async function loadModels() {
+      if (typeof faceapi === "undefined") {
+        statusBox.textContent = "오류: 얼굴 인식 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침해 주세요.";
+        return;
+      }
+      try {
+        var start = performance.now();
+        await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+        var sec = ((performance.now() - start) / 1000).toFixed(1);
+        var backend = "알 수 없음";
+        try { backend = faceapi.tf.getBackend(); } catch (e) {}
+        statusBox.textContent = "준비 완료 (모델 로딩 " + sec + "초, 처리 방식: " + backend + ")";
+        input.disabled = false;
+      } catch (e) {
+        statusBox.textContent = "오류: 모델 파일을 불러오지 못했습니다. (" + e.message + ")";
+      }
+    }
+
+    input.addEventListener("change", function () {
+      var file = input.files[0];
+      if (!file) return;
+      result.textContent = "분석 중...";
+      photo.style.display = "none";
+
+      photo.onload = async function () {
+        photo.style.display = "block";
+        try {
+          var options = new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.5 });
+          var faces = await faceapi.detectAllFaces(photo, options);
+          if (faces.length === 0) {
+            result.textContent = "얼굴을 찾지 못했습니다. 얼굴이 작거나, 너무 어둡거나, 옆모습이거나, 마스크·선글라스로 가려졌을 수 있습니다. 정면이 크게 나온 밝은 사진으로 다시 선택해 주세요.";
+          } else if (faces.length === 1) {
+            result.textContent = "얼굴 1개 검출됨 (확신도 " + Math.round(faces[0].score * 100) + "%)";
+          } else {
+            result.textContent = "얼굴 " + faces.length + "개 검출됨. 기준 인물은 한 명만 나온 사진이 좋습니다.";
+          }
+        } catch (e) {
+          result.textContent = "오류: 분석에 실패했습니다. (" + e.message + ")";
+        }
+      };
+      photo.onerror = function () {
+        result.textContent = "오류: 이 사진을 열 수 없습니다. 다른 사진(JPG, PNG)을 선택해 주세요.";
+      };
+      photo.src = URL.createObjectURL(file);
+    });
+
+    loadModels();
+  </script>
 </body>
 </html>
