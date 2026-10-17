@@ -7,48 +7,153 @@
   <style>
     body { font-family: sans-serif; margin: 0; padding: 20px; background: #f4f4f4; color: #222; }
     h1 { font-size: 24px; }
+    h2 { font-size: 20px; margin-top: 28px; }
     p { font-size: 16px; line-height: 1.5; }
     .box { padding: 12px; background: #fff; border-radius: 8px; margin-bottom: 16px; line-height: 1.5; }
     input[type=file] { font-size: 16px; }
-    button { font-size: 16px; padding: 10px 14px; margin-top: 10px; border-radius: 8px; border: 1px solid #888; background: #eee; }
+    button { font-size: 16px; padding: 10px 14px; margin-top: 10px; margin-right: 6px; border-radius: 8px; border: 1px solid #888; background: #eee; }
+    button:disabled { opacity: 0.5; }
     #summary { font-size: 18px; font-weight: bold; margin: 12px 0 4px 0; line-height: 1.5; }
-    #perf { font-size: 14px; color: #555; margin-bottom: 12px; }
+    #perf, #saveNote { font-size: 14px; color: #555; margin-bottom: 8px; line-height: 1.4; }
     .item { display: flex; gap: 10px; align-items: center; background: #fff; border-radius: 8px; padding: 8px; margin-bottom: 8px; }
-    .item canvas { width: 64px; height: 64px; border-radius: 6px; flex-shrink: 0; }
+    .item img { width: 64px; height: 64px; border-radius: 6px; flex-shrink: 0; object-fit: cover; background: #ddd; }
     .msg { font-size: 14px; line-height: 1.4; word-break: break-all; }
     .ok { color: #0a7a2f; }
     .warn { color: #b26a00; }
     .bad { color: #c62828; }
     .small-btn { font-size: 13px; padding: 4px 8px; margin-top: 4px; }
+    video { width: 100%; border-radius: 8px; background: #000; margin-bottom: 12px; }
+    .setting { display: block; margin-bottom: 14px; font-size: 16px; line-height: 1.5; }
+    .setting select { font-size: 16px; padding: 4px; }
+    .setting input[type=range] { width: 100%; }
+    .hint { font-size: 13px; color: #555; }
+    progress { width: 100%; height: 16px; margin-top: 12px; }
+    #progressText { font-size: 14px; line-height: 1.5; margin: 6px 0 12px 0; }
+    #segSummary { font-size: 16px; font-weight: bold; line-height: 1.5; margin-bottom: 8px; }
+    .seg { background: #fff; border-radius: 8px; padding: 10px; margin-bottom: 8px; line-height: 1.5; font-size: 15px; }
   </style>
 </head>
 <body>
   <h1>인물 장면 찾기</h1>
   <div id="status" class="box">모델을 불러오는 중입니다... (처음에는 약 7MB를 받아서 시간이 걸릴 수 있습니다)</div>
 
-  <p>1단계: 기준 인물 사진을 여러 장 선택하세요. (그 사람 혼자 나온 사진, 각도와 밝기가 다양할수록 좋습니다)</p>
+  <h2>1단계: 기준 인물 등록</h2>
+  <p>그 사람 혼자 나온 사진을 여러 장 선택하세요. 각도와 밝기가 다양할수록 좋습니다.</p>
   <input type="file" id="photoInput" accept="image/*" multiple disabled>
   <div><button id="resetBtn">등록 초기화</button></div>
-
   <div id="summary">등록된 사진: 0장</div>
   <div id="perf"></div>
+  <div id="saveNote"></div>
   <div id="list"></div>
+
+  <h2>2단계: 동영상 분석</h2>
+  <input type="file" id="videoInput" accept="video/*" disabled>
+  <div id="videoInfo" class="box" style="display:none; margin-top:12px;"></div>
+  <video id="video" controls playsinline preload="auto" style="display:none;"></video>
+
+  <div class="box">
+    <label class="setting">분석 간격 (다음 분석부터 적용)
+      <select id="intervalSel">
+        <option value="2">2초마다 (빠름)</option>
+        <option value="1" selected>1초마다</option>
+        <option value="0.5">0.5초마다 (느리지만 꼼꼼)</option>
+      </select>
+    </label>
+    <label class="setting">같은 인물 기준값: <b id="thVal">0.55</b>
+      <input type="range" id="thSlider" min="0.30" max="0.80" step="0.01" value="0.55">
+      <span class="hint">작을수록 엄격합니다(다른 사람은 덜 잡지만 놓칠 수 있음). 클수록 느슨합니다(놓치는 건 줄지만 다른 사람이 섞일 수 있음). 0.55는 임시 시작값이며 정확도를 보장하지 않습니다.</span>
+    </label>
+    <label class="setting">구간 합치기 간격
+      <select id="gapSel">
+        <option value="1">1초</option>
+        <option value="2">2초</option>
+        <option value="3" selected>3초</option>
+        <option value="5">5초</option>
+        <option value="10">10초</option>
+      </select>
+      <span class="hint">얼굴이 잠깐 가려지거나 화면 밖으로 나가도, 이 시간 안에 다시 나오면 한 구간으로 묶습니다.</span>
+    </label>
+  </div>
+
+  <button id="startBtn" disabled>분석 시작</button>
+  <button id="stopBtn" disabled>중단</button>
+  <p class="hint">분석 중에는 화면을 켜 두고 다른 앱으로 이동하지 마세요. 화면이 꺼지거나 앱을 바꾸면 느려지거나 멈출 수 있습니다.</p>
+  <progress id="bar" value="0" max="1"></progress>
+  <div id="progressText"></div>
+
+  <div id="segSummary"></div>
+  <div id="segList"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
   <script>
     var MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model/";
-    var MAX_SIDE = 800;
-    var SAME_PERSON_DISTANCE = 0.6;
+    var PHOTO_MAX_SIDE = 800;
+    var FRAME_MAX_SIDE = 640;
+    var REG_WARN_DISTANCE = 0.6;
+    var STORAGE_KEY = "psf_person_v1";
 
     var statusBox = document.getElementById("status");
     var input = document.getElementById("photoInput");
     var list = document.getElementById("list");
     var summary = document.getElementById("summary");
     var perf = document.getElementById("perf");
+    var saveNote = document.getElementById("saveNote");
     var resetBtn = document.getElementById("resetBtn");
+
+    var videoInput = document.getElementById("videoInput");
+    var videoInfo = document.getElementById("videoInfo");
+    var video = document.getElementById("video");
+    var intervalSel = document.getElementById("intervalSel");
+    var thSlider = document.getElementById("thSlider");
+    var thVal = document.getElementById("thVal");
+    var gapSel = document.getElementById("gapSel");
+    var startBtn = document.getElementById("startBtn");
+    var stopBtn = document.getElementById("stopBtn");
+    var bar = document.getElementById("bar");
+    var progressText = document.getElementById("progressText");
+    var segSummary = document.getElementById("segSummary");
+    var segList = document.getElementById("segList");
 
     var options = null;
     var person = { name: "인물 1", items: [] };
+
+    var currentFile = null;
+    var videoUrl = null;
+    var videoReady = false;
+    var running = false;
+    var stopRequested = false;
+    var frames = [];
+    var framesInterval = 1;
+    var segments = [];
+    var previewEnd = null;
+    var wakeLock = null;
+
+    /* ---------- 공통 도구 ---------- */
+
+    function fmt(t) {
+      var tenths = Math.round(t * 10);
+      var m = Math.floor(tenths / 600);
+      var s = (tenths % 600) / 10;
+      return m + ":" + (s < 10 ? "0" : "") + s.toFixed(1);
+    }
+
+    function fmtSec(t) {
+      t = Math.max(0, Math.round(t));
+      var m = Math.floor(t / 60);
+      var s = t % 60;
+      return m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    function distance(a, b) {
+      var sum = 0;
+      for (var i = 0; i < a.length; i++) {
+        var d = a[i] - b[i];
+        sum += d * d;
+      }
+      return Math.sqrt(sum);
+    }
+
+    /* ---------- 모델 로딩 ---------- */
 
     async function loadModels() {
       if (typeof faceapi === "undefined") {
@@ -66,17 +171,20 @@
         try { backend = faceapi.tf.getBackend(); } catch (e) {}
         statusBox.textContent = "준비 완료 (모델 로딩 " + sec + "초, 처리 방식: " + backend + ")";
         input.disabled = false;
+        videoInput.disabled = false;
       } catch (e) {
         statusBox.textContent = "오류: 모델 파일을 불러오지 못했습니다. (" + e.message + ")";
       }
     }
+
+    /* ---------- 1단계: 인물 등록 ---------- */
 
     function fileToCanvas(file) {
       return new Promise(function (resolve, reject) {
         var url = URL.createObjectURL(file);
         var img = new Image();
         img.onload = function () {
-          var scale = Math.min(1, MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+          var scale = Math.min(1, PHOTO_MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
           var c = document.createElement("canvas");
           c.width = Math.round(img.naturalWidth * scale);
           c.height = Math.round(img.naturalHeight * scale);
@@ -92,28 +200,22 @@
       });
     }
 
-    function drawThumb(thumb, source) {
+    function makeThumb(source) {
+      var c = document.createElement("canvas");
+      c.width = 64;
+      c.height = 64;
       var s = Math.min(source.width, source.height);
       var sx = (source.width - s) / 2;
       var sy = (source.height - s) / 2;
-      thumb.getContext("2d").drawImage(source, sx, sy, s, s, 0, 0, 64, 64);
-    }
-
-    function distance(a, b) {
-      var sum = 0;
-      for (var i = 0; i < a.length; i++) {
-        var d = a[i] - b[i];
-        sum += d * d;
-      }
-      return Math.sqrt(sum);
+      c.getContext("2d").drawImage(source, sx, sy, s, s, 0, 0, 64, 64);
+      return c.toDataURL("image/jpeg", 0.7);
     }
 
     function addRow(name) {
       var div = document.createElement("div");
       div.className = "item";
-      var thumb = document.createElement("canvas");
-      thumb.width = 64;
-      thumb.height = 64;
+      var thumb = document.createElement("img");
+      thumb.alt = "";
       var msg = document.createElement("div");
       msg.className = "msg";
       var title = document.createElement("div");
@@ -159,9 +261,43 @@
           if (a !== b) sum += distance(items[a].descriptor, items[b].descriptor);
         }
         var avg = sum / (items.length - 1);
-        if (avg > SAME_PERSON_DISTANCE) {
+        if (avg > REG_WARN_DISTANCE) {
           items[a].row.flag.textContent = "다른 사람 사진일 수 있습니다 (다른 사진들과의 평균 거리 " + avg.toFixed(2) + "). 확인 후 제거해 주세요.";
         }
+      }
+    }
+
+    function saveRegistration() {
+      try {
+        var data = person.items.map(function (it) {
+          return { d: Array.from(it.descriptor), thumb: it.thumb };
+        });
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ name: person.name, items: data }));
+        saveNote.textContent = person.items.length > 0 ? "등록 정보는 이 폰의 브라우저에만 저장되어 있습니다. (사진 원본은 저장하지 않고 얼굴 특징 숫자만 저장)" : "";
+      } catch (e) {
+        saveNote.textContent = "참고: 이 브라우저에서는 등록 정보를 저장하지 못했습니다. 새로고침하면 다시 등록해야 합니다.";
+      }
+    }
+
+    function loadRegistration() {
+      try {
+        var raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        var data = JSON.parse(raw);
+        var saved = data.items || [];
+        for (var i = 0; i < saved.length; i++) {
+          var row = addRow("저장된 사진 " + (i + 1));
+          row.thumb.src = saved[i].thumb;
+          var item = { descriptor: new Float32Array(saved[i].d), thumb: saved[i].thumb, row: row };
+          person.items.push(item);
+          setState(row, "저장된 얼굴 특징 사용 중", "ok");
+          addRemoveButton(row, item);
+        }
+        if (person.items.length > 0) {
+          saveNote.textContent = "등록 정보는 이 폰의 브라우저에만 저장되어 있습니다. (사진 원본은 저장하지 않고 얼굴 특징 숫자만 저장)";
+        }
+      } catch (e) {
+        saveNote.textContent = "저장된 등록 정보를 읽지 못했습니다. 사진을 다시 등록해 주세요.";
       }
     }
 
@@ -170,11 +306,13 @@
       btn.className = "small-btn";
       btn.textContent = "제거";
       btn.addEventListener("click", function () {
+        if (running) return;
         var idx = person.items.indexOf(item);
         if (idx >= 0) person.items.splice(idx, 1);
         row.div.remove();
         updateSummary();
         checkConsistency();
+        saveRegistration();
       });
       row.msg.appendChild(btn);
     }
@@ -191,7 +329,8 @@
         var row = addRow(files[i].name);
         try {
           var canvas = await fileToCanvas(files[i]);
-          drawThumb(row.thumb, canvas);
+          var thumbUrl = makeThumb(canvas);
+          row.thumb.src = thumbUrl;
           var found = await faceapi.detectAllFaces(canvas, options).withFaceLandmarks().withFaceDescriptors();
           processed++;
 
@@ -201,7 +340,7 @@
             setState(row, "제외: 얼굴이 " + found.length + "개 나옵니다. 그 사람 혼자 나온 사진을 선택해 주세요.", "bad");
           } else {
             var det = found[0].detection;
-            var item = { descriptor: found[0].descriptor, row: row };
+            var item = { descriptor: found[0].descriptor, thumb: thumbUrl, row: row };
             person.items.push(item);
             var text = "등록됨 (확신도 " + Math.round(det.score * 100) + "%)";
             var cls = "ok";
@@ -226,17 +365,295 @@
       }
       updateSummary();
       checkConsistency();
+      saveRegistration();
       input.value = "";
       input.disabled = false;
     });
 
     resetBtn.addEventListener("click", function () {
+      if (running) return;
       person.items = [];
       list.innerHTML = "";
       perf.textContent = "";
       updateSummary();
+      saveRegistration();
     });
 
+    /* ---------- 2단계: 동영상 선택 ---------- */
+
+    videoInput.addEventListener("change", function () {
+      var file = videoInput.files[0];
+      if (!file || running) return;
+      currentFile = file;
+      videoReady = false;
+      startBtn.disabled = true;
+      frames = [];
+      bar.value = 0;
+      progressText.textContent = "";
+      renderSegments();
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+      videoUrl = URL.createObjectURL(file);
+      videoInfo.style.display = "block";
+      videoInfo.textContent = "영상 정보를 읽는 중...";
+      video.style.display = "block";
+      video.src = videoUrl;
+      video.load();
+    });
+
+    video.addEventListener("loadedmetadata", function () {
+      var dur = video.duration;
+      if (!isFinite(dur) || dur <= 0) {
+        videoInfo.textContent = "오류: 영상 길이를 알 수 없습니다. 다른 영상으로 시도해 주세요.";
+        return;
+      }
+      videoReady = true;
+      startBtn.disabled = false;
+      var mb = currentFile ? (currentFile.size / 1048576).toFixed(0) : "?";
+      var text = "영상 길이 " + fmtSec(dur) + ", 크기 " + video.videoWidth + "x" + video.videoHeight + ", 파일 " + mb + "MB";
+      if (dur > 600) {
+        text += "\n주의: 10분이 넘는 영상입니다. 이번 테스트 버전은 긴 영상을 검증하지 않았습니다. 짧은 영상으로 먼저 시험해 보세요.";
+      }
+      videoInfo.style.whiteSpace = "pre-line";
+      videoInfo.textContent = text;
+    });
+
+    video.addEventListener("error", function () {
+      videoReady = false;
+      startBtn.disabled = true;
+      videoInfo.textContent = "오류: 이 영상을 재생할 수 없습니다. 영상 형식(예: H.265/HEVC)을 이 브라우저가 지원하지 않을 수 있습니다. 다른 영상으로 시도해 주세요.";
+    });
+
+    video.addEventListener("timeupdate", function () {
+      if (previewEnd !== null && video.currentTime >= previewEnd) {
+        video.pause();
+        previewEnd = null;
+      }
+    });
+
+    /* ---------- 2단계: 분석 ---------- */
+
+    function seekTo(t) {
+      return new Promise(function (resolve, reject) {
+        if (Math.abs(video.currentTime - t) < 0.005) {
+          resolve();
+          return;
+        }
+        var timer = setTimeout(function () {
+          video.removeEventListener("seeked", onSeeked);
+          reject(new Error("영상 위치 이동 시간 초과"));
+        }, 15000);
+        function onSeeked() {
+          clearTimeout(timer);
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        }
+        video.addEventListener("seeked", onSeeked);
+        video.currentTime = t;
+      });
+    }
+
+    async function lockScreen() {
+      try {
+        if (navigator.wakeLock) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          return true;
+        }
+      } catch (e) {}
+      wakeLock = null;
+      return false;
+    }
+
+    function unlockScreen() {
+      try { if (wakeLock) wakeLock.release(); } catch (e) {}
+      wakeLock = null;
+    }
+
+    async function analyze() {
+      if (running || !videoReady) return;
+      if (person.items.length === 0) {
+        progressText.textContent = "먼저 1단계에서 기준 인물 사진을 등록해 주세요.";
+        return;
+      }
+      running = true;
+      stopRequested = false;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      videoInput.disabled = true;
+      input.disabled = true;
+      resetBtn.disabled = true;
+      video.pause();
+      previewEnd = null;
+      frames = [];
+      segList.innerHTML = "";
+      framesInterval = parseFloat(intervalSel.value);
+
+      var dur = video.duration;
+      var times = [];
+      for (var t = 0.1; t < dur; t += framesInterval) times.push(t);
+
+      var scale = Math.min(1, FRAME_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight));
+      var fc = document.createElement("canvas");
+      fc.width = Math.round(video.videoWidth * scale);
+      fc.height = Math.round(video.videoHeight * scale);
+      var fctx = fc.getContext("2d");
+
+      var awake = await lockScreen();
+      var startTs = performance.now();
+      var errors = 0;
+      var consecutiveErrors = 0;
+      var abortedMsg = "";
+
+      try {
+        for (var i = 0; i < times.length; i++) {
+          if (stopRequested) break;
+          try {
+            await seekTo(times[i]);
+            fctx.drawImage(video, 0, 0, fc.width, fc.height);
+            var found = await faceapi.detectAllFaces(fc, options).withFaceLandmarks().withFaceDescriptors();
+            var best = Infinity;
+            for (var f = 0; f < found.length; f++) {
+              for (var k = 0; k < person.items.length; k++) {
+                var d = distance(found[f].descriptor, person.items[k].descriptor);
+                if (d < best) best = d;
+              }
+            }
+            frames.push({ t: times[i], dist: best, faces: found.length });
+            consecutiveErrors = 0;
+          } catch (e) {
+            errors++;
+            consecutiveErrors++;
+            frames.push({ t: times[i], dist: Infinity, faces: 0, error: true });
+            if (consecutiveErrors >= 5) {
+              abortedMsg = "연속 오류로 중단되었습니다: " + e.message;
+              break;
+            }
+          }
+
+          var done = i + 1;
+          var elapsed = (performance.now() - startTs) / 1000;
+          var avg = elapsed / done;
+          var th = parseFloat(thSlider.value);
+          var hitFrames = 0;
+          for (var h = 0; h < frames.length; h++) {
+            if (frames[h].dist <= th) hitFrames++;
+          }
+          bar.value = done / times.length;
+          progressText.textContent = "프레임 " + done + "/" + times.length + " (" + Math.round(done / times.length * 100) + "%) · 경과 " + fmtSec(elapsed) + " · 남은 예상 " + fmtSec(avg * (times.length - done)) + " · 프레임당 평균 " + avg.toFixed(2) + "초 · 찾은 프레임 " + hitFrames + "개";
+          if (done % 5 === 0) renderSegments();
+          await new Promise(function (r) { setTimeout(r, 0); });
+        }
+
+        var totalSec = (performance.now() - startTs) / 1000;
+        var processedCount = frames.length;
+        var msg = (stopRequested ? "중단됨. " : "분석 완료. ") + processedCount + "프레임 처리, 총 " + fmtSec(totalSec) + " (프레임당 평균 " + (totalSec / Math.max(1, processedCount)).toFixed(2) + "초)";
+        if (errors > 0) msg += ", 오류 프레임 " + errors + "개";
+        msg += awake ? " · 화면 켜짐 유지: 사용" : " · 화면 켜짐 유지: 미지원(화면이 꺼지지 않게 직접 조심해 주세요)";
+        if (abortedMsg) msg += ". " + abortedMsg;
+        progressText.textContent = msg;
+        renderSegments();
+      } catch (e) {
+        progressText.textContent = "오류: 분석 중 문제가 생겼습니다. (" + e.message + ")";
+      } finally {
+        unlockScreen();
+        running = false;
+        stopBtn.disabled = true;
+        startBtn.disabled = !videoReady;
+        videoInput.disabled = false;
+        input.disabled = false;
+        resetBtn.disabled = false;
+      }
+    }
+
+    startBtn.addEventListener("click", analyze);
+    stopBtn.addEventListener("click", function () {
+      stopRequested = true;
+      stopBtn.disabled = true;
+    });
+
+    /* ---------- 구간 계산과 표시 ---------- */
+
+    function buildSegments() {
+      var th = parseFloat(thSlider.value);
+      var gap = Math.max(parseFloat(gapSel.value), framesInterval * 1.01);
+      var segs = [];
+      for (var i = 0; i < frames.length; i++) {
+        var fr = frames[i];
+        if (fr.dist > th) continue;
+        var last = segs[segs.length - 1];
+        if (last && fr.t - last.end <= gap) {
+          last.end = fr.t;
+          last.count++;
+          if (fr.dist < last.minDist) last.minDist = fr.dist;
+        } else {
+          segs.push({ start: fr.t, end: fr.t, count: 1, minDist: fr.dist });
+        }
+      }
+      return segs;
+    }
+
+    function previewSegment(seg) {
+      if (running || !videoReady) return;
+      previewEnd = Math.min(video.duration, seg.end + framesInterval);
+      video.currentTime = Math.max(0, seg.start - 1);
+      var p = video.play();
+      if (p && p.catch) p.catch(function () {});
+    }
+
+    function renderSegments() {
+      segList.innerHTML = "";
+      if (frames.length === 0) {
+        segSummary.textContent = "";
+        return;
+      }
+      segments = buildSegments();
+      var withFace = 0;
+      var minAll = Infinity;
+      for (var i = 0; i < frames.length; i++) {
+        if (frames[i].faces > 0) withFace++;
+        if (frames[i].dist < minAll) minAll = frames[i].dist;
+      }
+      var text = "분석한 프레임 " + frames.length + "개 중 얼굴이 보인 프레임 " + withFace + "개. 찾은 구간 " + segments.length + "개.";
+      if (minAll !== Infinity) {
+        text += " 등록 사진과 가장 가까웠던 거리: " + minAll.toFixed(2) + " (기준값이 이보다 커야 찾아집니다)";
+      }
+      segSummary.textContent = text;
+
+      segments.forEach(function (seg, idx) {
+        var div = document.createElement("div");
+        div.className = "seg";
+        var info = document.createElement("div");
+        info.textContent = "구간 " + (idx + 1) + ": " + fmt(seg.start) + " ~ " + fmt(seg.end) + " (길이 " + (seg.end - seg.start).toFixed(1) + "초, " + seg.count + "프레임 감지, 최소 거리 " + seg.minDist.toFixed(2) + ")";
+        div.appendChild(info);
+        if (seg.count === 1) {
+          var warn = document.createElement("div");
+          warn.className = "warn";
+          warn.textContent = "1프레임에서만 감지되었습니다. 다른 사람을 잘못 찾은 것일 수 있습니다.";
+          div.appendChild(warn);
+        }
+        var btn = document.createElement("button");
+        btn.textContent = "미리보기 (앞 1초 포함)";
+        btn.addEventListener("click", function () { previewSegment(seg); });
+        div.appendChild(btn);
+        segList.appendChild(div);
+      });
+
+      if (segments.length > 0) {
+        var note = document.createElement("div");
+        note.className = "hint";
+        note.textContent = "시작·종료 시간은 분석 간격(" + framesInterval + "초)만큼 오차가 있을 수 있습니다. 정밀 보정은 다음 단계에서 추가합니다.";
+        segList.appendChild(note);
+      }
+    }
+
+    thSlider.addEventListener("input", function () {
+      thVal.textContent = parseFloat(thSlider.value).toFixed(2);
+      renderSegments();
+    });
+    gapSel.addEventListener("change", renderSegments);
+
+    /* ---------- 시작 ---------- */
+
+    loadRegistration();
     updateSummary();
     loadModels();
   </script>
