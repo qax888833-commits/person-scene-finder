@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>인물 장면 찾기 v10</title></head>
+<body>
+<p id="m" style="font-family:sans-serif;padding:20px">v10 불러오는 중...</p>
+<script type="text/plain" id="patch10">
+(function () {
+  var warn = window.__v10warn || [];
+
+  function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+  function el(tag, cls, html) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html != null) e.innerHTML = html;
+    return e;
+  }
+  function pctl(arr, p) {
+    if (!arr.length) return null;
+    var a = arr.slice().sort(function (x, y) { return x - y; });
+    return a[Math.min(a.length - 1, Math.max(0, Math.round(p * (a.length - 1))))];
+  }
+  function tick() { return new Promise(function (r) { setTimeout(r, 0); }); }
+
+  /* =========================================================
+     학습 모델: 사진/영상에서 고른 대표 얼굴 + 묶음 평균(중심) 얼굴
+     ========================================================= */
+  var model = { pos: [], neg: [] };
+  try {
+    var rawReg = localStorage.getItem("psf_person_v2");
+    if (rawReg) {
+      var dReg = JSON.parse(rawReg);
+      if (dReg && dReg.model) { model.pos = dReg.model.pos || []; model.neg = dReg.model.neg || []; }
+    }
+  } catch (e0) {}
+
+  scoreFace = function (f) {
+    var p = 0, n = 0, i, s;
+    for (i = 0; i < person.items.length; i++) {
+      s = sim(f.desc, person.items[i].descriptor);
+      if (s > p) p = s;
+    }
+    for (i = 0; i < person.negs.length; i++) {
+      s = sim(f.desc, person.negs[i].descriptor);
+      if (s > n) n = s;
+    }
+    for (i = 0; i < model.pos.length; i++) {
+      s = sim(f.desc, model.pos[i]);
+      if (s > p) p = s;
+    }
+    for (i = 0; i < model.neg.length; i++) {
+      s = sim(f.desc, model.neg[i]);
+      if (s > n) n = s;
+    }
+    f.pos = p;
+    f.neg = n;
+  };
+
+  var origRegData = registrationData;
+  registrationData = function () {
+    var d = origRegData();
+    d.model = { pos: model.pos.map(roundVec), neg: model.neg.map(roundVec) };
+    return d;
+  };
+  var origApply = applyRegistrationData;
+  applyRegistrationData = function (data) {
+    origApply(data);
+    model.pos = (data && data.model && data.model.pos) || [];
+    model.neg = (data && data.model && data.model.neg) || [];
+  };
+
+  /* =========================================================
+     설정 UI: 빠른 분석
+     ========================================================= */
+  var intervalLabel = intervalSel.closest("label");
+  var fastLabel = el("label", "setting",
+    '<input type="checkbox" id="fastChk" checked style="margin-right:8px">빠른 분석 (2초 간격으로 먼저 훑고, 인물이 보인 곳 주변만 촘촘히 다시 분석)' +
+    '<br><span class="hint">끄면 전 구간을 위에서 고른 간격으로 분석합니다(느림). 위 간격이 2초일 때는 적용되지 않습니다. 2초 안에 짧게 지나가는 장면은 놓칠 수 있습니다.</span>');
+  intervalLabel.parentNode.insertBefore(fastLabel, intervalLabel);
+  var fastChk = document.getElementById("fastChk");
+
+  /* =========================================================
+     인물 선택(학습) 박스
+     ========================================================= */
+  var pickBox = el("div", "box",
+    '<h2 style="margin-top:0">인물 선택 (영상에서 찍어서 학습)</h2>' +
+    '<div class="hint">분석된 얼굴을 비슷한 것끼리 묶었습니다. 찾는 사람의 묶음에 ✅, 다른 사람 묶음에 ❌를 누르면 그 사람의 특징을 학습하고 기준값도 자동으로 맞춥니다. 사진 등록 없이 시작해도 됩니다. 같은 사람이 안경·옆모습 등으로 따로 묶여 있으면 그것도 ✅를 눌러 주세요. 학습 결과는 다음 영상에도 이어집니다.</div>' +
+    '<label class="setting" style="margin-top:8px">묶는 기준 <b id="groupVal">0.55</b><input type="range" id="groupThr" min="0.40" max="0.80" step="0.01" value="0.55"><span class="hint">낮추면 크게 묶이고(다른 사람이 섞일 수 있음), 높이면 잘게 나뉩니다.</span></label>' +
+    '<div><button id="pickRebuild">다시 묶기</button><button id="pickRefine">선택한 사람 주변 정밀 분석</button><button id="pickReset">학습 초기화</button></div>' +
+    '<label class="setting" style="margin-top:8px"><input type="checkbox" id="autoThr" checked style="margin-right:8px">선택 후 확실/애매 기준 자동 설정</label>' +
+    '<div id="pickInfo" class="hint" style="margin-top:8px"></div>' +
+    '<div id="pickList" style="margin-top:8px"></div>');
+  pickBox.style.display = "none";
+  var h2s = document.querySelectorAll("h2");
+  var h3 = null;
+  for (var hi = 0; hi < h2s.length; hi++) { if (h2s[hi].textContent.indexOf("3단계") === 0) { h3 = h2s[hi]; break; } }
+  if (h3) h3.parentNode.insertBefore(pickBox, h3); else document.body.appendChild(pickBox);
+
+  var groupThr = document.getElementById("groupThr");
+  var groupVal = document.getElementById("groupVal");
+  var pickRebuild = document.getElementById("pickRebuild");
+  var pickRefine = document.getElementById("pickRefine");
+  var pickReset = document.getElementById("pickReset");
+  var autoThr = document.getElementById("autoThr");
+  var pickInfo = document.getElementById("pickInfo");
+  var pickList = document.getElementById("pickList");
+
+  var clusters = [];
+  var cstate = {};
+  var stateCents = [];
+  var pickedFaces = [];
+  var clusterSig = "";
+  var building = false;
+  var learning = false;
+
+  /* ---------- 묶기 ---------- */
+  function addToCluster(c, it) {
+    var d = it.face.desc;
+    var n = c.n;
+    for (var i = 0; i < c.cent.length; i++) c.cent[i] = (c.cent[i] * n + d[i]) / (n + 1);
+    c.n = n + 1;
+    c.members.push(it);
+  }
+
+  async function buildClusters() {
+    if (building || running) return;
+    building = true;
+    clusterSig = videoKey() + "|" + frames.length;
+    pickInfo.textContent = "얼굴을 묶는 중...";
+    try {
+      var thr = parseFloat(groupThr.value);
+      var items = [];
+      frames.forEach(function (fr) {
+        fr.faces.forEach(function (f) {
+          if ((f.score || 0) >= 0.5 && f.desc && f.desc.length) items.push({ t: fr.t, face: f });
+        });
+      });
+      if (items.length > 4000) {
+        var stp = items.length / 4000, sub = [];
+        for (var q = 0; q < 4000; q++) sub.push(items[Math.floor(q * stp)]);
+        items = sub;
+      }
+      items.sort(function (a, b) { return (b.face.score || 0) - (a.face.score || 0); });
+      var cl = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var best = -1, bs = 0;
+        for (var k = 0; k < cl.length; k++) {
+          var s = sim(it.face.desc, cl[k].cent);
+          if (s > bs) { bs = s; best = k; }
+        }
+        if (best >= 0 && bs >= thr) {
+          addToCluster(cl[best], it);
+        } else {
+          cl.push({ id: 0, cent: it.face.desc.slice(), n: 1, members: [it] });
+        }
+        if (i % 150 === 0) await tick();
+      }
+      /* 너무 잘게 나뉜 묶음 합치기 */
+      var merged = true, guard = 0;
+      while (merged && guard < 6) {
+        merged = false; guard++;
+        for (var a = 0; a < cl.length && !merged; a++) {
+          for (var b = a + 1; b < cl.length; b++) {
+            if (sim(cl[a].cent, cl[b].cent) >= thr + 0.03) {
+              var big = cl[a].n >= cl[b].n ? a : b;
+              var small = big === a ? b : a;
+              cl[small].members.forEach(function (m) { addToCluster(cl[big], m); });
+              cl.splice(small, 1);
+              merged = true;
+              break;
+            }
+          }
+        }
+        await tick();
+      }
+      cl.sort(function (x, y) { return y.n - x.n; });
+      cl.forEach(function (c, idx) { c.id = idx + 1; });
+      clusters = cl;
+      /* 이전에 고른 상태를 새 묶음에 이어 붙이기 */
+      cstate = {};
+      clusters.forEach(function (c) {
+        var bestSt = null, bestS = 0;
+        stateCents.forEach(function (sc) {
+          var s2 = sim(c.cent, sc.cent);
+          if (s2 >= thr && s2 > bestS) { bestS = s2; bestSt = sc.st; }
+        });
+        if (bestSt) cstate[c.id] = bestSt;
+      });
+      renderClusters();
+      pickInfo.textContent = clusters.length === 0 ? "묶을 얼굴이 없습니다." : "얼굴 묶음 " + clusters.length + "개 (얼굴이 2개 이상인 묶음만 아래에 표시합니다).";
+    } catch (e) {
+      pickInfo.textContent = "얼굴 묶기에 실패했습니다: " + e.message;
+    } finally {
+      building = false;
+    }
+  }
+
+  function spreadByTime(members, count) {
+    var arr = members.slice().sort(function (a, b) { return a.t - b.t; });
+    if (arr.length <= count) return arr;
+    var out = [];
+    for (var i = 0; i < count; i++) out.push(arr[Math.round(i * (arr.length - 1) / (count - 1))]);
+    return out;
+  }
+
+  function renderClusters() {
+    pickList.innerHTML = "";
+    var shown = clusters.filter(function (c) { return c.n >= 2; }).slice(0, 15);
+    if (shown.length === 0) {
+      pickList.appendChild(el("div", "hint", "표시할 묶음이 없습니다. '묶는 기준'을 낮춰 다시 묶어 보세요."));
+      return;
+    }
+    shown.forEach(function (c, idx) {
+      var st = cstate[c.id] || null;
+      var div = el("div", "seg");
+      div.style.border = st === "yes" ? "2px solid #0a7a2f" : st === "no" ? "2px solid #c62828" : "2px solid transparent";
+      var ts = c.members.map(function (m) { return m.t; });
+      var tmin = Math.min.apply(null, ts), tmax = Math.max.apply(null, ts);
+      var title = el("div", null, "묶음 " + (idx + 1) + " · 얼굴 " + c.n + "개 · " + fmt(tmin) + " ~ " + fmt(tmax) + (st === "yes" ? " · ✅ 찾는 사람" : st === "no" ? " · ❌ 다른 사람" : ""));
+      div.appendChild(title);
+      var row = el("div");
+      row.style.cssText = "display:flex;gap:6px;margin:6px 0;";
+      spreadByTime(c.members, 4).forEach(function (m) {
+        var img = el("img");
+        img.src = m.face.thumb;
+        img.style.cssText = "width:64px;height:64px;border-radius:6px;object-fit:cover;background:#ddd;";
+        row.appendChild(img);
+      });
+      div.appendChild(row);
+      function btn(text, fn) {
+        var b = el("button", "small-btn", text);
+        b.addEventListener("click", fn);
+        div.appendChild(b);
+      }
+      btn(st === "yes" ? "✅ 선택 취소" : "✅ 이 사람", function () {
+        if (running || learning) return;
+        cstate[c.id] = st === "yes" ? null : "yes";
+        learn();
+      });
+      btn(st === "no" ? "❌ 선택 취소" : "❌ 다른 사람", function () {
+        if (running || learning) return;
+        cstate[c.id] = st === "no" ? null : "no";
+        learn();
+      });
+      btn("영상에서 보기", function () {
+        var m0 = c.members[0];
+        playRange(m0.t - 1, m0.t + 1.5);
+      });
+      pickList.appendChild(div);
+    });
+  }
+
+  /* ---------- 학습 ---------- */
+  function pickDiverse(members, K) {
+    var pool = members.filter(function (m) { return (m.face.score || 0) >= 0.6; });
+    if (pool.length < K) pool = members.slice();
+    pool.sort(function (a, b) { return (b.face.score || 0) - (a.face.score || 0); });
+    if (pool.length > 300) pool = pool.slice(0, 300);
+    if (pool.length <= K) return pool;
+    var chosen = [pool[0]];
+    var maxSim = pool.map(function (m) { return sim(m.face.desc, pool[0].face.desc); });
+    maxSim[0] = 9;
+    while (chosen.length < K) {
+      var bi = -1, bv = 99;
+      for (var i = 0; i < pool.length; i++) {
+        if (maxSim[i] < bv) { bv = maxSim[i]; bi = i; }
+      }
+      if (bi < 0 || bv >= 9) break;
+      chosen.push(pool[bi]);
+      maxSim[bi] = 9;
+      for (var j = 0; j < pool.length; j++) {
+        if (maxSim[j] >= 9) continue;
+        var s = sim(pool[j].face.desc, pool[bi].face.desc);
+        if (s > maxSim[j]) maxSim[j] = s;
+      }
+    }
+    return chosen;
+  }
+
+  function labelBatch(list, label) {
+    list.forEach(function (m) {
+      var face = m.face;
+      clearLabel(face);
+      face.label = label;
+      if (label === "yes") {
+        var row = addRow("영상에서 선택 (" + fmt(m.t) + ")");
+        row.thumb.src = face.thumb;
+        var item = { descriptor: face.desc, thumb: face.thumb, src: "video", row: row, face: face };
+        person.items.push(item);
+        face.refPos = item;
+        setState(row, "영상에서 직접 고른 얼굴", "ok");
+        addRemoveButton(row, item);
+      } else {
+        var neg = { descriptor: face.desc, thumb: face.thumb, face: face };
+        person.negs.push(neg);
+        face.refNeg = neg;
+        if (person.negs.length > MAX_NEGS) {
+          var old = person.negs.shift();
+          if (old.face) old.face.refNeg = null;
+        }
+      }
+      pickedFaces.push(face);
+    });
+  }
+
+  function setSlider(sl, v) { sl.value = Math.max(parseFloat(sl.min), Math.min(parseFloat(sl.max), v)).toFixed(2); }
+
+  async function learn() {
+    if (running || learning) return;
+    learning = true;
+    pickInfo.textContent = "학습 중...";
+    await tick();
+    try {
+      pickedFaces.forEach(function (f) { clearLabel(f); });
+      pickedFaces = [];
+      model.pos = []; model.neg = [];
+      stateCents = [];
+      var yesC = clusters.filter(function (c) { return cstate[c.id] === "yes"; });
+      var noC = clusters.filter(function (c) { return cstate[c.id] === "no"; });
+      yesC.forEach(function (c) {
+        labelBatch(pickDiverse(c.members, 10), "yes");
+        model.pos.push(c.cent.slice());
+        stateCents.push({ cent: c.cent.slice(), st: "yes" });
+      });
+      noC.forEach(function (c) {
+        labelBatch(pickDiverse(c.members, 6), "no");
+        model.neg.push(c.cent.slice());
+        stateCents.push({ cent: c.cent.slice(), st: "no" });
+      });
+      afterLabelChange();
+
+      var info = "";
+      if (yesC.length === 0) {
+        info = "찾는 사람 묶음에 ✅를 눌러 주세요. 지금 등록된 얼굴: " + person.items.length + "개.";
+      } else {
+        var posS = [], negS = [];
+        yesC.forEach(function (c) {
+          c.members.forEach(function (m) { if (m.face.label !== "yes") posS.push(m.face.pos); });
+        });
+        noC.forEach(function (c) {
+          c.members.forEach(function (m) { if (m.face.label !== "no") negS.push(m.face.pos); });
+        });
+        var posLo = pctl(posS, 0.1);
+        var negHi = negS.length >= 3 ? pctl(negS, 0.95) : null;
+        info = "학습됨: 찾는 사람 묶음 " + yesC.length + "개(대표 얼굴 " + pickedFaces.filter(function (f) { return f.label === "yes"; }).length + "개), 제외 묶음 " + noC.length + "개.";
+        if (posLo !== null && autoThr.checked) {
+          var sure, unsure, overlap = false;
+          if (negHi === null) {
+            sure = posLo;
+            unsure = posLo - 0.12;
+          } else if (posLo > negHi) {
+            var gap = posLo - negHi;
+            unsure = negHi + 0.3 * gap;
+            sure = negHi + 0.65 * gap;
+          } else {
+            overlap = true;
+            sure = negHi + 0.02;
+            unsure = Math.min(posLo, sure - 0.05);
+          }
+          setSlider(sureSlider, sure);
+          setSlider(unsureSlider, Math.min(unsure, parseFloat(sureSlider.value)));
+          sureSlider.dispatchEvent(new Event("input"));
+          info += " 같은 사람 점수 하위 10% " + pct(posLo) + (negHi !== null ? ", 다른 사람 점수 상위 5% " + pct(negHi) : "") + " → 확실 기준 " + sureSlider.value + ", 애매 기준 " + unsureSlider.value + "로 자동 설정했습니다.";
+          if (overlap) info += " 주의: 선택한 사람과 제외한 사람의 얼굴이 많이 닮아 점수가 겹칩니다. 3단계 확인으로 더 알려 주세요.";
+        } else if (posLo === null) {
+          info += " (묶음 안에 대표 얼굴 외 얼굴이 없어 기준값은 그대로 둡니다.)";
+        }
+        info += " 이제 '선택한 사람 주변 정밀 분석'을 누르면 그 사람이 나온 곳 주변만 촘촘히 다시 봅니다.";
+      }
+      pickInfo.textContent = info;
+      renderClusters();
+    } catch (e) {
+      pickInfo.textContent = "학습 중 오류: " + e.message;
+    } finally {
+      learning = false;
+    }
+  }
+
+  groupThr.addEventListener("input", function () { groupVal.textContent = parseFloat(groupThr.value).toFixed(2); });
+  groupThr.addEventListener("change", function () { if (!running) buildClusters(); });
+  pickRebuild.addEventListener("click", function () { if (!running) buildClusters(); });
+  pickRefine.addEventListener("click", function () { execute("refine"); });
+  pickReset.addEventListener("click", function () {
+    if (running || learning) return;
+    pickedFaces.forEach(function (f) { clearLabel(f); });
+    pickedFaces = [];
+    model.pos = []; model.neg = []; stateCents = []; cstate = {};
+    afterLabelChange();
+    renderClusters();
+    pickInfo.textContent = "학습한 내용을 초기화했습니다.";
+  });
+  resetBtn.addEventListener("click", function () {
+    model.pos = []; model.neg = []; stateCents = []; cstate = {}; pickedFaces = [];
+    saveRegistration();
+    renderClusters();
+  });
+  clearNegBtn.addEventListener("click", function () {
+    model.neg = [];
+    stateCents = stateCents.filter(function (s) { return s.st !== "no"; });
+    Object.keys(cstate).forEach(function (k) { if (cstate[k] === "no") cstate[k] = null; });
+    saveRegistration();
+    rescoreAll();
+    renderSegments();
+    renderReview();
+    renderClusters();
+  });
+
+  /* =========================================================
+     빠른 분석 (2단계 샘플링 + 이동·검출 겹치기)
+     ========================================================= */
+  async function execute(kind) {
+    if (running || recording || !videoReady || !human) return;
+    if (kind === "refine" && frames.length === 0) { progressText.textContent = "먼저 분석을 시작해 주세요."; return; }
+    running = true;
+    stopRequested = false;
+    clearTimeout(saveTimer);
+    startBtn.disabled = true; stopBtn.disabled = false; videoInput.disabled = true; input.disabled = true;
+    resetBtn.disabled = true; clearNegBtn.disabled = true; backupBtn.disabled = true; restoreInput.disabled = true;
+    pickRefine.disabled = true;
+    video.pause();
+    previewEnd = null;
+
+    var userFine = parseFloat(intervalSel.value);
+    var fine = (kind === "refine") ? Math.min(userFine, 1) : userFine;
+    var fast = (kind === "refine") || (fastChk.checked && userFine < 2);
+    var coarse = fast ? 2 : fine;
+    framesInterval = fine;
+    if (kind === "full") {
+      frames = [];
+      labelHistory = [];
+      pickedFaces = [];
+      for (var a0 = 0; a0 < person.items.length; a0++) person.items[a0].face = null;
+      for (var b0 = 0; b0 < person.negs.length; b0++) person.negs[b0].face = null;
+      segList.innerHTML = "";
+      reviewList.innerHTML = "";
+      reviewInfo.textContent = "";
+      dbNote.textContent = "";
+      undoBtn.style.display = "none";
+      clusters = []; cstate = {}; clusterSig = "";
+    }
+    var maxSide = parseInt(resSel.value, 10);
+    var cropOn = cropAnalyzeChk.checked && crop;
+    var R = cropOn ? window.__cropPx() : { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
+
+    var awake = false, errors = 0, consec = 0, abortedMsg = "", hitFrames = 0, doneCount = 0;
+    var stageDone = 0, stageTotal = 0, stageName = "", needPick = false;
+    var startTs = performance.now();
+    var seen = {};
+    function key(t) { return Math.round(t * 100); }
+    frames.forEach(function (fr) { seen[key(fr.t)] = true; });
+
+    function addFrame(fr) {
+      frames.push(fr);
+      if (frames.length > 1 && frames[frames.length - 2].t > fr.t) {
+        frames.sort(function (x, y) { return x.t - y.t; });
+      }
+    }
+    function progress() {
+      var elapsed = (performance.now() - startTs) / 1000;
+      var avg = elapsed / Math.max(1, doneCount);
+      bar.value = stageTotal > 0 ? Math.min(1, stageDone / stageTotal) : 0;
+      progressText.textContent = stageName + " · 프레임 " + stageDone + "/" + stageTotal + " · 경과 " + fmtSec(elapsed) + " · 남은 예상(이 단계) " + fmtSec(avg * (stageTotal - stageDone)) + " · 프레임당 평균 " + avg.toFixed(2) + "초 · 새로 찾은 프레임 " + hitFrames + "개";
+    }
+    async function safeSeek(t) {
+      try { await seekTo(t); return true; } catch (e) { return false; }
+    }
+
+    try {
+      var dur = video.duration;
+      var scale = Math.min(1, maxSide / Math.max(R.w, R.h));
+      var fc = document.createElement("canvas");
+      fc.width = Math.max(2, Math.round(R.w * scale));
+      fc.height = Math.max(2, Math.round(R.h * scale));
+      var fctx = fc.getContext("2d");
+      var grid = function (step) {
+        var arr = [];
+        for (var k = 0; ; k++) {
+          var t = 0.1 + k * step;
+          if (t >= dur) break;
+          arr.push(t);
+        }
+        return arr;
+      };
+
+      var pass = async function (times, name) {
+        var n = times.length;
+        if (n === 0) return;
+        stageName = name; stageDone = 0; stageTotal = n;
+        var ready = await safeSeek(times[0]);
+        for (var i = 0; i < n && !abortedMsg; i++) {
+          if (stopRequested) break;
+          var t = times[i];
+          seen[key(t)] = true;
+          var det = null, derr = null, nextOk = true;
+          if (ready) {
+            fctx.drawImage(video, R.x, R.y, R.w, R.h, 0, 0, fc.width, fc.height);
+            var detP = detectFaces(fc).then(function (d) { det = d; }, function (e) { derr = e; });
+            var seekP = (i + 1 < n) ? safeSeek(times[i + 1]).then(function (ok) { nextOk = ok; }) : Promise.resolve();
+            await Promise.all([detP, seekP]);
+          } else {
+            derr = new Error("영상 위치 이동 실패");
+            if (i + 1 < n) nextOk = await safeSeek(times[i + 1]);
+          }
+          if (derr) {
+            errors++; consec++;
+            addFrame({ t: t, faces: [], error: true });
+            if (consec >= 5) abortedMsg = "연속 오류로 중단되었습니다: " + derr.message;
+          } else {
+            consec = 0;
+            var recs = [], hit = false;
+            for (var kf = 0; kf < det.faces.length; kf++) {
+              var d0 = det.faces[kf];
+              var rec = { t: t, desc: d0.embedding, thumb: cropFace(fc, d0.box), score: d0.score, pos: 0, neg: 0, label: null, refPos: null, refNeg: null };
+              scoreFace(rec);
+              if (statusOf(rec) === "target") hit = true;
+              recs.push(rec);
+            }
+            addFrame({ t: t, faces: recs });
+            if (hit) hitFrames++;
+          }
+          ready = nextOk;
+          doneCount++; stageDone++;
+          progress();
+          if (doneCount % 5 === 0) renderSegments();
+          if (doneCount % 30 === 0) saveAnalysis();
+          await tick();
+        }
+      };
+
+      var refinePass = async function () {
+        var m = Math.max(1, Math.round(2 / fine));
+        if (m < 2) return;
+        for (var round = 0; round < 3 && !stopRequested && !abortedMsg; round++) {
+          var want = {};
+          frames.forEach(function (fr) {
+            if (fr.error) return;
+            var near = fr.faces.some(function (f) { return statusOf(f) !== "other"; });
+            if (!near) return;
+            var k0 = Math.round((fr.t - 0.1) / fine);
+            for (var j = -(m - 1); j <= m - 1; j++) {
+              var kk = k0 + j;
+              if (kk < 0) continue;
+              var t2 = 0.1 + kk * fine;
+              if (t2 >= dur) continue;
+              var kc = key(t2);
+              if (seen[kc] || want[kc] !== undefined) continue;
+              want[kc] = t2;
+            }
+          });
+          var ts = Object.keys(want).map(function (k) { return want[k]; }).sort(function (x, y) { return x - y; });
+          if (ts.length === 0) break;
+          await pass(ts, "정밀 분석 " + (round + 1) + "회차 (인물이 보인 곳 주변)");
+        }
+      };
+
+      awake = await lockScreen();
+      startTs = performance.now();
+      if (kind === "full") {
+        await pass(grid(coarse), fast ? "1단계: 넓게 훑는 중" : "분석 중");
+        var known = person.items.length > 0 || model.pos.length > 0;
+        if (fast && !stopRequested && !abortedMsg) {
+          if (known) await refinePass();
+          else needPick = true;
+        } else if (!known) {
+          needPick = true;
+        }
+      } else {
+        await refinePass();
+      }
+
+      var totalSec = (performance.now() - startTs) / 1000;
+      var msg = (stopRequested ? "중단됨. " : "분석 완료. ") + "해상도 " + maxSide + (cropOn ? "(자른 영역만)" : "") + ", 전체 " + frames.length + "프레임, 이번 작업 " + doneCount + "프레임 처리, 총 " + fmtSec(totalSec) + " (프레임당 평균 " + (totalSec / Math.max(1, doneCount)).toFixed(2) + "초)";
+      if (kind === "full" && fast) msg += ". 전부 촘촘히 분석했다면 약 " + grid(fine).length + "프레임";
+      if (errors > 0) msg += ", 오류 프레임 " + errors + "개";
+      if (abortedMsg) msg += ". " + abortedMsg;
+      if (needPick) msg += ". 아래 '인물 선택'에서 찾는 사람 묶음에 ✅를 누른 뒤 '선택한 사람 주변 정밀 분석'을 눌러 주세요.";
+      progressText.textContent = msg;
+      bar.value = 1;
+      renderSegments();
+      renderReview();
+    } catch (e) {
+      progressText.textContent = "오류: 분석 중 문제가 생겼습니다. (" + e.message + ")";
+    } finally {
+      unlockScreen();
+      running = false;
+      stopBtn.disabled = true;
+      startBtn.disabled = !videoReady;
+      videoInput.disabled = false;
+      input.disabled = false;
+      resetBtn.disabled = false;
+      clearNegBtn.disabled = false;
+      backupBtn.disabled = false;
+      restoreInput.disabled = false;
+      pickRefine.disabled = false;
+      saveAnalysis();
+    }
+  }
+
+  window.analyze2 = function () { return execute("full"); };
+
+  setInterval(function () {
+    if (running || building || learning) return;
+    if (frames.length === 0) { pickBox.style.display = "none"; clusterSig = ""; return; }
+    pickBox.style.display = "block";
+    var sig = videoKey() + "|" + frames.length;
+    if (sig !== clusterSig) buildClusters();
+  }, 1000);
+
+  /* =========================================================
+     영상 크기 자르기
+     ========================================================= */
+  var cropBox = el("div", "box",
+    '<h2 style="margin-top:0">영상 화면 크기 자르기</h2>' +
+    '<div class="hint">남길 영역을 정합니다. 모서리를 끌면 크기, 안쪽을 끌면 위치가 바뀝니다. 4단계에서 만드는 영상(클립 저장 포함)에 적용됩니다. 영상을 다른 장면으로 옮긴 뒤 "현재 화면으로 새로고침"을 누르면 그 장면 기준으로 볼 수 있습니다.</div>' +
+    '<label class="setting" style="margin-top:8px">비율 <select id="cropAspect">' +
+    '<option value="free">자유</option><option value="orig">원본 비율</option><option value="9:16">9:16 (세로 영상)</option><option value="16:9">16:9 (가로 영상)</option><option value="1:1">1:1 (정사각형)</option><option value="4:5">4:5</option>' +
+    '</select></label>' +
+    '<canvas id="cropCv"></canvas>' +
+    '<div><button id="cropMake">자르기 영역 만들기</button><button id="cropGrab">현재 화면으로 새로고침</button><button id="cropClear">자르기 해제</button></div>' +
+    '<label class="setting" style="margin-top:8px"><input type="checkbox" id="cropAnalyzeChk" style="margin-right:8px">분석도 자른 영역만 (더 빠름, 인물이 영역 밖에 있으면 못 찾음)</label>' +
+    '<div id="cropInfo" class="hint"></div>');
+  cropBox.style.display = "none";
+  var eListEl = document.getElementById("eList");
+  var anchor = eListEl ? eListEl.parentNode : null;
+  if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(cropBox, anchor); else document.body.appendChild(cropBox);
+
+  var cvEl = document.getElementById("cropCv");
+  cvEl.style.cssText = "width:100%;height:auto;touch-action:none;background:#000;border-radius:8px;display:block;margin:8px 0;";
+  var cctx = cvEl.getContext("2d");
+  var snap = document.createElement("canvas");
+  var sctx = snap.getContext("2d");
+  var aspSel = document.getElementById("cropAspect");
+  var cropInfo = document.getElementById("cropInfo");
+  var cropAnalyzeChk = document.getElementById("cropAnalyzeChk");
+  var crop = null;
+  var drag = null;
+
+  function VW() { return video.videoWidth || 0; }
+  function VH() { return video.videoHeight || 0; }
+  function arOf() {
+    var v = aspSel.value;
+    if (v === "free") return 0;
+    if (v === "orig") return VW() / VH();
+    var p = v.split(":");
+    return parseFloat(p[0]) / parseFloat(p[1]);
+  }
+
+  window.__cropPx = function () {
+    if (!crop) return { x: 0, y: 0, w: VW(), h: VH() };
+    var x = clamp(Math.round(crop.x), 0, Math.max(0, VW() - 2));
+    var y = clamp(Math.round(crop.y), 0, Math.max(0, VH() - 2));
+    var w = Math.max(2, Math.min(Math.round(crop.w), VW() - x));
+    var h = Math.max(2, Math.min(Math.round(crop.h), VH() - y));
+    return { x: x, y: y, w: w, h: h };
+  };
+
+  function cropKey() { return "psf_crop|" + videoKey(); }
+  function persistCrop() {
+    try {
+      if (!crop) localStorage.removeItem(cropKey());
+      else localStorage.setItem(cropKey(), JSON.stringify({ vw: VW(), vh: VH(), c: crop }));
+    } catch (e) {}
+  }
+  function loadCrop() {
+    crop = null;
+    try {
+      var raw = localStorage.getItem(cropKey());
+      if (raw) {
+        var o = JSON.parse(raw);
+        if (o && o.vw === VW() && o.vh === VH() && o.c) crop = o.c;
+      }
+    } catch (e) {}
+  }
+  function updateInfo() {
+    var t = crop
+      ? "자르기: " + window.__cropPx().w + "×" + window.__cropPx().h + " (원본 " + VW() + "×" + VH() + "). 4단계 영상 만들기에 적용됩니다."
+      : "자르기 안 함 (원본 전체).";
+    if (warn.length) t += " 주의: 일부 자동 연결에 실패했습니다(" + warn.join(", ") + "). 자르기가 영상 만들기에 적용되지 않을 수 있습니다.";
+    cropInfo.textContent = t;
+  }
+  function sizeCanvas() {
+    if (!VW() || !VH()) return;
+    cvEl.width = Math.min(720, VW());
+    cvEl.height = Math.round(cvEl.width * VH() / VW());
+    snap.width = cvEl.width;
+    snap.height = cvEl.height;
+  }
+  function redraw() {
+    if (!VW() || !cvEl.width) return;
+    cctx.drawImage(snap, 0, 0);
+    if (!crop) return;
+    var s = cvEl.width / VW();
+    var x = crop.x * s, y = crop.y * s, w = crop.w * s, h = crop.h * s;
+    var bb = cvEl.getBoundingClientRect();
+    var k = bb.width > 0 ? cvEl.width / bb.width : 1;
+    cctx.fillStyle = "rgba(0,0,0,0.55)";
+    cctx.fillRect(0, 0, cvEl.width, y);
+    cctx.fillRect(0, y + h, cvEl.width, cvEl.height - y - h);
+    cctx.fillRect(0, y, x, h);
+    cctx.fillRect(x + w, y, cvEl.width - x - w, h);
+    cctx.strokeStyle = "#fff";
+    cctx.lineWidth = 2 * k;
+    cctx.strokeRect(x, y, w, h);
+    cctx.fillStyle = "#fff";
+    var hs = 12 * k;
+    [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].forEach(function (c) {
+      cctx.fillRect(c[0] - hs / 2, c[1] - hs / 2, hs, hs);
+    });
+  }
+  function grab() {
+    if (!VW() || !snap.width) return;
+    try { sctx.drawImage(video, 0, 0, snap.width, snap.height); } catch (e) {}
+    redraw();
+  }
+  function keepIn() {
+    crop.w = Math.min(crop.w, VW());
+    crop.h = Math.min(crop.h, VH());
+    crop.x = clamp(crop.x, 0, VW() - crop.w);
+    crop.y = clamp(crop.y, 0, VH() - crop.h);
+  }
+  function makeDefault() {
+    var Wv = VW(), Hv = VH(), r = arOf(), w, h;
+    if (r) {
+      h = Hv * 0.9; w = h * r;
+      if (w > Wv * 0.9) { w = Wv * 0.9; h = w / r; }
+    } else { w = Wv * 0.8; h = Hv * 0.8; }
+    crop = { x: (Wv - w) / 2, y: (Hv - h) / 2, w: w, h: h };
+  }
+  function toVid(e) {
+    var bb = cvEl.getBoundingClientRect();
+    return { x: (e.clientX - bb.left) / bb.width * VW(), y: (e.clientY - bb.top) / bb.height * VH() };
+  }
+  function resizeTo(px, py) {
+    var Wv = VW(), Hv = VH();
+    px = clamp(px, 0, Wv); py = clamp(py, 0, Hv);
+    var ax = drag.ax, ay = drag.ay;
+    var sx = px >= ax ? 1 : -1, sy = py >= ay ? 1 : -1;
+    var w = Math.abs(px - ax), h = Math.abs(py - ay);
+    var r = arOf();
+    var maxW = sx > 0 ? Wv - ax : ax;
+    var maxH = sy > 0 ? Hv - ay : ay;
+    if (r) {
+      if (w / r > h) h = w / r; else w = h * r;
+      var f = Math.min(1, maxW / Math.max(w, 1), maxH / Math.max(h, 1));
+      w *= f; h *= f;
+      if (w < 40) { w = 40; h = 40 / r; }
+    } else {
+      w = Math.max(40, Math.min(w, maxW));
+      h = Math.max(40, Math.min(h, maxH));
+    }
+    crop = { x: sx > 0 ? ax : ax - w, y: sy > 0 ? ay : ay - h, w: w, h: h };
+    keepIn();
+  }
+
+  cvEl.addEventListener("pointerdown", function (e) {
+    if (!crop) return;
+    var p = toVid(e);
+    var bb = cvEl.getBoundingClientRect();
+    var hr = 30 / bb.width * VW();
+    var corners = [
+      [crop.x, crop.y, crop.x + crop.w, crop.y + crop.h],
+      [crop.x + crop.w, crop.y, crop.x, crop.y + crop.h],
+      [crop.x, crop.y + crop.h, crop.x + crop.w, crop.y],
+      [crop.x + crop.w, crop.y + crop.h, crop.x, crop.y]
+    ];
+    drag = null;
+    for (var i = 0; i < corners.length; i++) {
+      var c = corners[i];
+      if (Math.abs(p.x - c[0]) <= hr && Math.abs(p.y - c[1]) <= hr) {
+        drag = { mode: "resize", ax: c[2], ay: c[3] };
+        break;
+      }
+    }
+    if (!drag && p.x >= crop.x && p.x <= crop.x + crop.w && p.y >= crop.y && p.y <= crop.y + crop.h) {
+      drag = { mode: "move", dx: p.x - crop.x, dy: p.y - crop.y };
+    }
+    if (drag) {
+      try { cvEl.setPointerCapture(e.pointerId); } catch (e2) {}
+      e.preventDefault();
+    }
+  });
+  cvEl.addEventListener("pointermove", function (e) {
+    if (!drag || !crop) return;
+    var p = toVid(e);
+    if (drag.mode === "move") {
+      crop.x = clamp(p.x - drag.dx, 0, VW() - crop.w);
+      crop.y = clamp(p.y - drag.dy, 0, VH() - crop.h);
+    } else {
+      resizeTo(p.x, p.y);
+    }
+    redraw();
+    updateInfo();
+    e.preventDefault();
+  });
+  function endDrag() { if (drag) { drag = null; persistCrop(); } }
+  cvEl.addEventListener("pointerup", endDrag);
+  cvEl.addEventListener("pointercancel", endDrag);
+
+  aspSel.addEventListener("change", function () {
+    var r = arOf();
+    if (crop && r) {
+      var cx = crop.x + crop.w / 2, cy = crop.y + crop.h / 2;
+      var h = crop.h, w = h * r;
+      if (w > VW()) { w = VW(); h = w / r; }
+      if (h > VH()) { h = VH(); w = h * r; }
+      crop = { x: cx - w / 2, y: cy - h / 2, w: w, h: h };
+      keepIn();
+      persistCrop();
+    }
+    redraw();
+    updateInfo();
+  });
+  document.getElementById("cropMake").addEventListener("click", function () {
+    if (!VW()) return;
+    makeDefault();
+    persistCrop();
+    redraw();
+    updateInfo();
+  });
+  document.getElementById("cropGrab").addEventListener("click", function () { grab(); });
+  document.getElementById("cropClear").addEventListener("click", function () {
+    crop = null;
+    persistCrop();
+    redraw();
+    updateInfo();
+  });
+
+  video.addEventListener("loadedmetadata", function () {
+    if (!VW()) return;
+    sizeCanvas();
+    loadCrop();
+    cropBox.style.display = "block";
+    updateInfo();
+  });
+  video.addEventListener("loadeddata", function () { grab(); });
+  video.addEventListener("seeked", function () { if (!running && !recording) grab(); });
+  videoInput.addEventListener("change", function () {
+    crop = null;
+    cropBox.style.display = "none";
+    clusters = []; cstate = {}; stateCents = []; pickedFaces = []; clusterSig = "";
+    pickList.innerHTML = "";
+    pickInfo.textContent = "";
+  });
+})();
+</script>
+<script>
+(async function () {
+  var m = document.getElementById("m");
+  var warn = [];
+  function swap(txt, find, repl, name) {
+    var i = txt.indexOf(find);
+    if (i < 0) { warn.push(name); return txt; }
+    return txt.slice(0, i) + repl + txt.slice(i + find.length);
+  }
+  try {
+    var q = "?" + Date.now();
+    var rs = await Promise.all([fetch("v5.html" + q, { cache: "no-store" }), fetch("v9.html" + q, { cache: "no-store" })]);
+    if (!rs[0].ok) throw new Error("v5.html을 찾을 수 없습니다 (" + rs[0].status + "). v10.html과 같은 폴더에 v5.html이 있어야 합니다.");
+    if (!rs[1].ok) throw new Error("v9.html을 찾을 수 없습니다 (" + rs[1].status + "). v10.html과 같은 폴더에 v9.html이 있어야 합니다.");
+    var h = await rs[0].text();
+    var h9 = await rs[1].text();
+
+    var mm = h9.match(/<script type="text\/plain" id="patch">([\s\S]*?)<\/script>/);
+    if (!mm) throw new Error("v9.html에서 영상 만들기 코드를 찾지 못했습니다.");
+    var p9 = mm[1];
+
+    /* 영상 만들기(v9)에 자르기 적용 */
+    p9 = swap(p9, "var s = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight));",
+      "var CR = window.__cropPx ? window.__cropPx() : { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };\n      var s = Math.min(1, 1280 / Math.max(CR.w, CR.h));", "영상 크기 계산");
+    p9 = swap(p9, "Math.round(video.videoWidth * s / 2)", "Math.round(CR.w * s / 2)", "가로 크기");
+    p9 = swap(p9, "Math.round(video.videoHeight * s / 2)", "Math.round(CR.h * s / 2)", "세로 크기");
+    p9 = swap(p9, "cctx.drawImage(video, 0, 0, cv.width, cv.height)", "cctx.drawImage(video, CR.x, CR.y, CR.w, CR.h, 0, 0, cv.width, cv.height)", "그리기");
+
+    /* 분석 시작 버튼을 새 분석으로 연결 */
+    h = swap(h, 'startBtn.addEventListener("click", analyze);',
+      'startBtn.addEventListener("click", function () { if (window.analyze2) return analyze2(); return analyze(); });', "분석 버튼");
+    h = h.replace("인물 장면 찾기 v5", "인물 장면 찾기 v10").replace("인물 장면 찾기 (v5)", "인물 장면 찾기 (v10)");
+
+    var i = h.lastIndexOf("</body>");
+    if (i < 0) throw new Error("v5.html 형식이 예상과 다릅니다.");
+    var p10 = "window.__v10warn=" + JSON.stringify(warn) + ";\n" + document.getElementById("patch10").textContent;
+    var tagS = "<scr" + "ipt>", tagE = "</scr" + "ipt>";
+    h = h.slice(0, i) + tagS + p9 + tagE + tagS + p10 + tagE + h.slice(i);
+    document.open(); document.write(h); document.close();
+  } catch (e) {
+    m.textContent = "오류: " + e.message;
+  }
+})();
+</script>
+</body></html>
